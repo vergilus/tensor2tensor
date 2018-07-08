@@ -19,6 +19,9 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+
+import tensorflow as tf
+
 from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
@@ -26,12 +29,7 @@ from tensor2tensor.data_generators import text_problems
 from tensor2tensor.data_generators import translate
 from tensor2tensor.utils import registry
 
-import tensorflow as tf
-
 FLAGS = tf.flags.FLAGS
-
-# End-of-sentence marker.
-EOS = text_encoder.EOS_ID
 
 # End-of-sentence marker.
 EOS = text_encoder.EOS_ID
@@ -65,6 +63,16 @@ _NC_TEST_DATASETS = [[
 _UN_TRAIN_DATASETS = [[
     "https://s3-us-west-2.amazonaws.com/twairball.wmt17.zh-en/UNv1.0.en-zh.tar"
     ".gz", ["en-zh/UNv1.0.en-zh.en", "en-zh/UNv1.0.en-zh.zh"]
+]]
+
+_NJU_TRAIN_DATASETS = [[
+    "/nju_train_zh2en.tar.gz",
+    ["nju_train_zh2en/zh.shuf", "nju_train_zh2en/en.shuf"]
+]]
+
+_NJU_DEV_DATASETS = [[
+    "/nju_dev_zh2en.tar.gz",
+    ["nju_dev_zh2en/dev02.zh", "nju_dev_zh2en/dev02.en"]
 ]]
 
 # CWMT corpus
@@ -279,3 +287,44 @@ class TranslateEnzhWmt8k(TranslateEnzhWmt32k):
   def get_training_dataset(self, tmp_dir):
     """Uses only News Commentary Dataset for training."""
     return _NC_TRAIN_DATASETS
+
+@registry.register_problem
+class TranslateZhenNju(TranslateEnzhWmt32k):
+  @property
+  def source_vocab_name(self):
+    return "vocab.enzh-zh.%d" % self.approx_vocab_size
+
+  @property
+  def target_vocab_name(self):
+    return "vocab.enzh-en.%d" % self.approx_vocab_size
+
+  def get_training_dataset(self, tmp_dir):
+    return _NJU_TRAIN_DATASETS
+
+  def generate_encoded_samples(self, data_dir, tmp_dir, dataset_split):
+    train = dataset_split == problem.DatasetSplit.TRAIN
+    train_dataset = self.get_training_dataset(tmp_dir)
+    datasets = train_dataset if train else _NJU_DEV_DATASETS
+    source_datasets = [[item[0], [item[1][0]]] for item in train_dataset]
+    target_datasets = [[item[0], [item[1][1]]] for item in train_dataset]
+    source_vocab = generator_utils.get_or_generate_vocab(
+        data_dir,
+        tmp_dir,
+        self.source_vocab_name,
+        self.approx_vocab_size,
+        source_datasets,
+        file_byte_budget=1e8)
+    target_vocab = generator_utils.get_or_generate_vocab(
+        data_dir,
+        tmp_dir,
+        self.target_vocab_name,
+        self.approx_vocab_size,
+        target_datasets,
+        file_byte_budget=1e8)
+    tag = "train" if train else "dev"
+    filename_base = "njunmt_enzh_%sk_tok_%s" % (self.approx_vocab_size, tag)
+    data_path = translate.compile_data(tmp_dir, datasets, filename_base)
+    return text_problems.text2text_generate_encoded(
+        text_problems.text2text_txt_iterator(data_path + ".lang1",
+                                             data_path + ".lang2"),
+        source_vocab, target_vocab)
