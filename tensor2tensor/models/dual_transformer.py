@@ -3,6 +3,7 @@ import tensorflow as tf
 from tensorflow.python.util import nest
 
 from tensor2tensor.layers import common_attention
+from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import beam_search
 from tensor2tensor.utils import registry
@@ -186,7 +187,8 @@ class DualTransformer(Transformer):
     hparams = self._hparams
     target_modality = self._problem_hparams.target_modality
 
-    assert self.has_input, "problems using dual-transformer must have inputs"
+    assert self.has_input, "problems for dual-transformer must have inputs"
+    # decode with an input source(needs encoder outputs)
     wav_inputs = features["wav_inputs"]
     txt_inputs = features["txt_inputs"]
     if target_modality.is_class_modality:
@@ -288,6 +290,7 @@ class DualTransformer(Transformer):
         logits = target_modality.top_sharded(body_outputs, None, dp)[0]
 
       ret = tf.squeeze(logits, axis=[1, 2, 3])
+
       return ret, cache
 
     ret = fast_decode(
@@ -304,6 +307,7 @@ class DualTransformer(Transformer):
       alpha=alpha,
       batch_size=batch_size,
       force_decode_length=self._decode_hparams.force_decode_length)
+
     return ret
 
 
@@ -329,7 +333,7 @@ def transformer_dual_decoder(decoder_input,
       (see common_attention.attention_bias())
     wav_enc_dec_attention_bias: bias Tensor for encoder-decoder attention
       (see common_attention.attention_bias())
-    txt_enc_dec_attention_bias: same
+    txt_enc_dec_attention_bias: the same
     hparams: hyperparameters for model
     cache: dict, containing tensors which are the results of previous
         attentions, used for fast decoding.
@@ -574,4 +578,69 @@ def fast_decode(wav_encoder_output,
 @registry.register_hparams
 def dual_transformer_nst():
   """ set of hyperparameters. """
-  
+  hparams = common_hparams.basic_params1() # training parameters
+  hparams.norm_type = "layer"
+  hparams.hidden_size = 512
+  hparams.batch_size = 8e6
+
+  hparams.max_length = 1650*80 # this limits inputs[1] * inputs[2]
+  hparams.add_hparam("max_wav_seq_length", 0)
+  hparams.add_hparam("max_txt_seq_length", 0)
+  hparams.max_target_seq_length = 350
+
+  hparams.clip_grad_norm = 0.  # i.e. no gradient clipping
+  hparams.learning_rate_schedule = (
+      "constant*linear_warmup*rsqrt_decay*rsqrt_hidden_size")
+  hparams.learning_rate_constant = 2.0
+  hparams.learning_rate_decay_scheme = "noam"
+  hparams.learning_rate = 0.2
+  hparams.learning_rate_warmup_steps = 8000
+  hparams.initializer_gain = 1.0
+  hparams.num_hidden_layers = 6
+  hparams.initializer = "uniform_unit_scaling"
+  hparams.weight_decay = 0.0
+  hparams.optimizer_adam_epsilon = 1e-9
+  hparams.optimizer_adam_beta1 = 0.9
+  hparams.optimizer_adam_beta2 = 0.997
+  hparams.num_sampled_classes = 0
+  hparams.label_smoothing = 0.1
+  hparams.shared_embedding_and_softmax_weights = True
+  hparams.symbol_modality_num_shards = 16
+  hparams.layer_preprocess_sequence = "n"
+  hparams.layer_postprocess_sequence = "da"
+
+  # Add new ones like this.
+  hparams.add_hparam("filter_size", 2048)
+  # Layer-related flags. If zero, these fall back on hparams.num_hidden_layers.
+  hparams.add_hparam("num_wav_enc_layers", 0)
+  hparams.add_hparam("num_txt_enc_layers", 0)
+  hparams.add_hparam("num_decoder_layers", 0)
+
+  # Attention-related flags.
+  hparams.add_hparam("num_heads", 8)
+  hparams.add_hparam("attention_key_channels", 0)
+  hparams.add_hparam("attention_value_channels", 0)
+  hparams.add_hparam("ffn_layer", "dense_relu_dense")
+  hparams.add_hparam("parameter_attention_key_channels", 0)
+  hparams.add_hparam("parameter_attention_value_channels", 0)
+
+  # All hyperparameters ending in "dropout" are automatically set to 0.0
+  # when not in training mode.
+  hparams.add_hparam("attention_dropout", 0.1)
+  hparams.add_hparam("attention_dropout_broadcast_dims", "")
+  hparams.add_hparam("relu_dropout", 0.1)
+  hparams.add_hparam("relu_dropout_broadcast_dims", "")
+  hparams.add_hparam("pos", "timing")  # timing, none
+  hparams.add_hparam("nbr_decoder_problems", 1)
+  hparams.add_hparam("proximity_bias", False)
+  hparams.add_hparam("use_pad_remover", True)
+  hparams.add_hparam("self_attention_type", "dot_product")
+  hparams.add_hparam("max_relative_position", 0)
+  hparams.add_hparam("conv_first_kernel", 3)
+  # These parameters are only used when ffn_layer=="local_moe_tpu"
+  hparams.add_hparam("moe_overhead_train", 1.0)
+  hparams.add_hparam("moe_overhead_eval", 2.0)
+  hparams.moe_num_experts = 16
+  hparams.moe_loss_coef = 1e-3
+
+  return hparams

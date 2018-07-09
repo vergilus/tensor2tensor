@@ -1,4 +1,4 @@
-
+# coding=utf-8
 import fnmatch
 import os
 import tarfile
@@ -7,9 +7,12 @@ import numpy as np
 import tensorflow as tf
 
 from speech_recognition import AudioEncoder
+from speech_recognition import add_delta_deltas
+from speech_recognition import compute_mel_filterbank_features
 from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
+from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import registry
 
 _NST_ASR_TRAIN_DATASETS = [
@@ -132,6 +135,10 @@ class NeuralSpeechTranslate(problem.Problem):
   def use_train_shards_for_dev(self):
     """If true, we only generate training data and hold out shards for dev."""
     return False
+
+  @property
+  def output_space_id(self):
+    return problem.SpaceID.ZH_TOK
 
 #---------------- for problem t2t-datagen by Vergilus   ------------------------
   def feature_encoders(self, data_dir):
@@ -298,7 +305,7 @@ class NeuralSpeechTranslate(problem.Problem):
     p = model_hparams
   # -------------------- for audio encoder ---------------------------------
     # Filterbank extraction in bottom instead of preprocess_example is faster.
-    p.add_hparam("audio_preproc_in_bottom", False)
+    p.add_hparam("audio_preproc_in_bottom", True)
     # The trainer seems to reserve memory for all members of the input dict
     p.add_hparam("audio_keep_example_waveforms", False)
     p.add_hparam("audio_sample_rate", 16000)
@@ -317,10 +324,56 @@ class NeuralSpeechTranslate(problem.Problem):
     # the dictionary is initialize in problem.get_hparams when trained
     source_vocab_size = self._encoders["txt_inputs"].vocab_size
     target_vocab_size = self._encoders["targets"].vocab_size
-    p.asr_input_modality = {"wav_inputs": ("audio:speech_recognition_modality", None)}
-    p.txt_input_modality = {"txt_inputs": (registry.Modalities.SYMBOL, source_vocab_size)}
+    p.input_modality = {"wav_inputs": ("audio:speech_recognition_modality", None),
+                        "txt_inputs": (registry.Modalities.SYMBOL, source_vocab_size)}
     p.target_modality = (registry.Modalities.SYMBOL, target_vocab_size)
     if self.vocab_type == VocabType.CHARACTER:
       p.loss_multiplier = 2.0
 
 
+  def preprocess_example(self, example, mode, hparams):
+    p = hparams
+    # preprocess wav_inputs
+    example["waveforms"] = example["wav_inputs"]
+    if p.audio_preproc_in_bottom:
+      example["wav_inputs"] = tf.expand_dims(
+        tf.expand_dims(example["waveforms"], -1), -1)
+    else:
+      waveforms = tf.expand_dims(example["waveforms"], 0)
+      mel_fbanks = compute_mel_filterbank_features(
+        waveforms,
+        sample_rate=p.audio_sample_rate,
+        dither=p.audio_dither,
+        preemphasis=p.audio_preemphasis,
+        frame_length=p.audio_frame_length,
+        frame_step=p.audio_frame_step,
+        lower_edge_hertz=p.audio_lower_edge_hertz,
+        upper_edge_hertz=p.audio_upper_edge_hertz,
+        num_mel_bins=p.audio_num_mel_bins,
+        apply_mask=False)
+      if p.audio_add_delta_deltas:
+        mel_fbanks = add_delta_deltas(mel_fbanks)
+      fbank_size = common_layers.shape_list(mel_fbanks)
+      assert fbank_size[0] == 1
+
+      # This replaces CMVN estimation on data
+      mean = tf.reduce_mean(mel_fbanks, keepdims=True, axis=1)
+      variance = tf.reduce_mean((mel_fbanks - mean) ** 2, keepdims=True, axis=1)
+      mel_fbanks = (mel_fbanks - mean) / variance
+
+      # Later models like to flatten the two spatial dims. Instead, we add a
+      # unit spatial dim and flatten the frequencies and channels.
+      example["wav_inputs"] = tf.concat([
+        tf.reshape(mel_fbanks, [fbank_size[1], fbank_size[2], fbank_size[3]]),
+        tf.zeros((p.num_zeropad_frames, fbank_size[2], fbank_size[3]))], 0)
+    if not p.audio_keep_example_waveforms:
+      del example["waveforms"]
+    # truncate inputs and targets
+    if hparams.max_wav_seq_length > 0:
+      example["wav_inputs"] = example["wav_inputs"][:hparams.max_wav_seq_length]
+    if hparams.max_txt_seq_length > 0:
+      example["txt_inputs"] = example["txt_inputs"][:hparams.max_txt_seq_length]
+    if hparams.max_target_seq_length > 0:
+      example["targets"] = example["targets"][:hparams.max_target_seq_length]
+
+    return example
