@@ -6,10 +6,10 @@ from tensor2tensor.layers import common_attention
 from tensor2tensor.layers import common_hparams
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import beam_search
+from tensor2tensor.utils import expert_utils
 from tensor2tensor.utils import registry
 from transformer import Transformer
 from transformer import features_to_nonpadding
-from transformer import transformer_encoder
 from transformer import transformer_ffn_layer
 from transformer import transformer_prepare_decoder
 from transformer import transformer_prepare_encoder
@@ -26,8 +26,9 @@ class DualTransformer(Transformer):
     """Encode transformer inputs.
 
     Args:
-      inputs1\2: Transformer inputs [batch_size, input_length, input_height,
+      wav_inputs: Transformer inputs [batch_size, input_length, input_height,
         hidden_dim] which will be flattened along the two spatial dimensions.
+      txt_inputs: same as former
       target_space: scalar, target space ID.
       hparams: hyperparameters for model.
       features: optionally pass the entire features dictionary as well.
@@ -36,9 +37,9 @@ class DualTransformer(Transformer):
 
     Returns:
       Tuple of:
-          encoder_output: Encoder representation.
+          *_encoder_output: Encoder representation.
               [batch_size, input_length, hidden_dim]
-          encoder_decoder_attention_bias: Bias and mask weights for
+          *_encoder_decoder_attention_bias: Bias and mask weights for
               encoder-decoder attention. [batch_size, input_length]
     """
     wav_inputs = common_layers.flatten4d3d(wav_inputs)
@@ -49,22 +50,30 @@ class DualTransformer(Transformer):
         wav_inputs, target_space, hparams, features=features))
     wav_encoder_input = tf.nn.dropout(wav_encoder_input,
                                   1.0 - hparams.layer_prepostprocess_dropout)
-    wav_encoder_output = transformer_encoder(
-      wav_encoder_input, wav_self_attention_bias,
-      hparams, nonpadding=features_to_nonpadding(features, "wav_inputs"),
-      save_weights_to=self.attention_weights,
-      losses=losses)
 
     txt_encoder_input, txt_self_attention_bias, txt_encoder_decoder_attention_bias = (
       transformer_prepare_encoder(
         txt_inputs, target_space, hparams, features=features))
     txt_encoder_input = tf.nn.dropout(txt_encoder_input,
                                    1.0 - hparams.layer_prepostprocess_dropout)
-    txt_encoder_output = transformer_encoder(
-      txt_encoder_input, txt_self_attention_bias,
-      hparams, nonpadding=features_to_nonpadding(features, "txt_inputs"),
+
+    wav_encoder_output = transformer_n_encoder(
+      wav_encoder_input,
+      wav_self_attention_bias,
+      hparams.num_wav_enc_layers,
+      hparams,name="wav_encoder",
+      nonpadding=features_to_nonpadding(features, "wav_inputs"),
       save_weights_to=self.attention_weights,
       losses=losses)
+
+    txt_encoder_output = transformer_n_encoder(
+      txt_encoder_input,
+      txt_self_attention_bias,
+      hparams.num_txt_enc_layers,
+      hparams, name="txt_encoder",
+      nonpadding=features_to_nonpadding(features, "txt_inputs"),
+      save_weights_to=self.attention_weights
+    )
 
     return wav_encoder_output, wav_encoder_decoder_attention_bias, \
            txt_encoder_output, txt_encoder_decoder_attention_bias
@@ -310,6 +319,61 @@ class DualTransformer(Transformer):
 
     return ret
 
+def transformer_n_encoder(encoder_input,
+                          encoder_self_attention_bias,
+                          num_layers,
+                         hparams,
+                         name="encoder",
+                         nonpadding=None,
+                         save_weights_to=None,
+                         make_image_summary=True,
+                         losses=None):
+  """ transformer with 2 sets of encoders """
+  x = encoder_input
+  attention_dropout_broadcast_dims = (
+    common_layers.comma_separated_string_to_integer_list(
+      getattr(hparams, "attention_dropout_broadcast_dims", "")))
+  with tf.variable_scope(name):
+    if nonpadding is not None:
+      padding = 1.0 - nonpadding
+    else:
+      padding = common_attention.attention_bias_to_padding(
+        encoder_self_attention_bias)
+      nonpadding = 1.0 - padding
+    pad_remover = None
+    if hparams.use_pad_remover and not common_layers.is_on_tpu():
+      pad_remover = expert_utils.PadRemover(padding)
+    for layer in range(num_layers or
+                       hparams.num_hidden_layers):
+      with tf.variable_scope("layer_%d" % layer):
+        with tf.variable_scope("self_attention"):
+          y = common_attention.multihead_attention(
+            common_layers.layer_preprocess(x, hparams),
+            None,
+            encoder_self_attention_bias,
+            hparams.attention_key_channels or hparams.hidden_size,
+            hparams.attention_value_channels or hparams.hidden_size,
+            hparams.hidden_size,
+            hparams.num_heads,
+            hparams.attention_dropout,
+            attention_type=hparams.self_attention_type,
+            save_weights_to=save_weights_to,
+            max_relative_position=hparams.max_relative_position,
+            make_image_summary=make_image_summary,
+            dropout_broadcast_dims=attention_dropout_broadcast_dims,
+            max_length=hparams.get("max_length"))
+          x = common_layers.layer_postprocess(x, y, hparams)
+        with tf.variable_scope("ffn"):
+          y = transformer_ffn_layer(
+            common_layers.layer_preprocess(x, hparams), hparams, pad_remover,
+            conv_padding="SAME", nonpadding_mask=nonpadding,
+            losses=losses)
+          x = common_layers.layer_postprocess(x, y, hparams)
+    # if normalization is done in layer_preprocess, then it should also be done
+    # on the output, since the output can grow very large, being the sum of
+    # a whole stack of unnormalized layer outputs.
+    return common_layers.layer_preprocess(x, hparams)
+
 
 def transformer_dual_decoder(decoder_input,
                              wav_encoder_output, txt_encoder_output,
@@ -333,7 +397,7 @@ def transformer_dual_decoder(decoder_input,
       (see common_attention.attention_bias())
     wav_enc_dec_attention_bias: bias Tensor for encoder-decoder attention
       (see common_attention.attention_bias())
-    txt_enc_dec_attention_bias: the same
+    txt_enc_dec_attention_bias: the same as former
     hparams: hyperparameters for model
     cache: dict, containing tensors which are the results of previous
         attentions, used for fast decoding.
@@ -353,6 +417,8 @@ def transformer_dual_decoder(decoder_input,
     y: a Tensors
   """
   x = decoder_input
+  x1 = None
+  x2 = None
   attention_dropout_broadcast_dims = (
       common_layers.comma_separated_string_to_integer_list(
           getattr(hparams, "attention_dropout_broadcast_dims", "")))
@@ -610,14 +676,14 @@ def dual_transformer_nst():
   hparams.layer_postprocess_sequence = "da"
 
   # Add new ones like this.
-  hparams.add_hparam("filter_size", 2048)
+  hparams.add_hparam("filter_size", 4096)
   # Layer-related flags. If zero, these fall back on hparams.num_hidden_layers.
   hparams.add_hparam("num_wav_enc_layers", 0)
   hparams.add_hparam("num_txt_enc_layers", 0)
   hparams.add_hparam("num_decoder_layers", 0)
 
   # Attention-related flags.
-  hparams.add_hparam("num_heads", 8)
+  hparams.add_hparam("num_heads", 16)
   hparams.add_hparam("attention_key_channels", 0)
   hparams.add_hparam("attention_value_channels", 0)
   hparams.add_hparam("ffn_layer", "dense_relu_dense")

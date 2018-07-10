@@ -13,6 +13,7 @@ from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
 from tensor2tensor.layers import common_layers
+from tensor2tensor.utils import metrics
 from tensor2tensor.utils import registry
 
 _NST_ASR_TRAIN_DATASETS = [
@@ -331,9 +332,18 @@ class NeuralSpeechTranslate(problem.Problem):
       p.loss_multiplier = 2.0
 
 
+  def example_reading_spec(self):
+    data_fields = {
+      "wav_inputs":tf.VarLenFeature(tf.float32),
+      "txt_inputs":tf.VarLenFeature(tf.int64),
+      "targets":tf.VarLenFeature(tf.int64)
+    }
+    data_items_to_decoders = None
+    return (data_fields, data_items_to_decoders)
+
   def preprocess_example(self, example, mode, hparams):
     p = hparams
-    # preprocess wav_inputs
+    # preprocess example['inputs', 'batch_prediction_key', 'targets' ]
     example["waveforms"] = example["wav_inputs"]
     if p.audio_preproc_in_bottom:
       example["wav_inputs"] = tf.expand_dims(
@@ -377,3 +387,11 @@ class NeuralSpeechTranslate(problem.Problem):
       example["targets"] = example["targets"][:hparams.max_target_seq_length]
 
     return example
+
+  def eval_metrics(self):
+    return [
+        metrics.Metrics.ACC, metrics.Metrics.ACC_TOP5,
+        metrics.Metrics.ACC_PER_SEQ, metrics.Metrics.NEG_LOG_PERPLEXITY,
+        metrics.Metrics.APPROX_BLEU, metrics.Metrics.ROUGE_2_F,
+        metrics.Metrics.ROUGE_L_F
+    ]

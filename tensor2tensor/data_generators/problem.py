@@ -16,17 +16,18 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+
 import collections
 import os
 import random
 
 import six
+import tensorflow as tf
+
 from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import text_encoder
 from tensor2tensor.utils import data_reader
 from tensor2tensor.utils import metrics
-import tensorflow as tf
-
 
 
 class DatasetSplit(object):
@@ -473,7 +474,8 @@ class Problem(object):
       feature_map["targets_segmentation"] = feature_map["inputs_segmentation"]
     if ("inputs_position" in feature_map and
         "targets_position" not in feature_map):
-      feature_map["targets_position"] = feature_map["inputs_position"]
+      self.position_ = feature_map["inputs_position"]
+      feature_map["targets_position"] = self.position_
 
   def maybe_reverse_and_copy(self, example):
     self.maybe_reverse_features(example)
@@ -750,7 +752,7 @@ class Problem(object):
         "partition_id": partition_id,
         "num_partitions": num_partitions,
     })
-
+    # print ("data generation params:",data_kwargs)
     dataset = self.dataset(**dataset_kwargs)
     if is_training:
       # Repeat and skip a random number of records
@@ -1020,7 +1022,7 @@ def _summarize_features(features, num_shards=1):
 def standardize_shapes(features, batch_size=None):
   """Set the right shapes for the features."""
 
-  for fname in ["inputs", "targets"]:
+  for fname in ["inputs", "targets", "wav_inputs", "txt_inputs"]:
     if fname not in features:
       continue
 
