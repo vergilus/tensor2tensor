@@ -480,9 +480,8 @@ def transformer_dual_decoder(decoder_input,
               max_length=hparams.get("max_length"))
             x2 = common_layers.layer_postprocess(x, y2, hparams)
         with tf.variable_scope("ffn"):
-          if x1 and x2:
+          if x1 is not None and x2 is not None:
             # with two encoder to attend to
-            # TODO (Vergil): check if dense relu returns dim whatever inputs_dim is
             y = transformer_ffn_layer(
                 tf.concat([common_layers.layer_preprocess(x1, hparams),
                            common_layers.layer_preprocess(x2, hparams)],axis=-1),
@@ -652,7 +651,7 @@ def dual_transformer_nst():
   hparams.max_length = 1650*80 # this limits inputs[1] * inputs[2]
   hparams.add_hparam("max_wav_seq_length", 0)
   hparams.add_hparam("max_txt_seq_length", 0)
-  hparams.max_target_seq_length = 350
+  hparams.max_target_seq_length = 200
 
   hparams.clip_grad_norm = 0.  # i.e. no gradient clipping
   hparams.learning_rate_schedule = (
@@ -660,7 +659,7 @@ def dual_transformer_nst():
   hparams.learning_rate_constant = 2.0
   hparams.learning_rate_decay_scheme = "noam"
   hparams.learning_rate = 0.2
-  hparams.learning_rate_warmup_steps = 8000
+  hparams.learning_rate_warmup_steps = 10000
   hparams.initializer_gain = 1.0
   hparams.num_hidden_layers = 6
   hparams.initializer = "uniform_unit_scaling"
