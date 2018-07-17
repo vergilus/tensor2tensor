@@ -306,7 +306,7 @@ class NeuralSpeechTranslate(problem.Problem):
     p = model_hparams
   # -------------------- for audio encoder ---------------------------------
     # Filterbank extraction in bottom instead of preprocess_example is faster.
-    p.add_hparam("audio_preproc_in_bottom", False)
+    p.add_hparam("audio_preproc_in_bottom", True)
     # The trainer seems to reserve memory for all members of the input dict
     p.add_hparam("audio_keep_example_waveforms", False)
     p.add_hparam("audio_sample_rate", 16000)

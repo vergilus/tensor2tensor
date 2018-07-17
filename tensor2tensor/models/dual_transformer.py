@@ -10,13 +10,21 @@ from tensor2tensor.utils import expert_utils
 from tensor2tensor.utils import registry
 from transformer import Transformer
 from transformer import features_to_nonpadding
-from transformer import transformer_ffn_layer
 from transformer import transformer_prepare_decoder
 from transformer import transformer_prepare_encoder
 
 
 @registry.register_model
 class DualTransformer(Transformer):
+
+  @property
+  def has_input(self):
+    if self._problem_hparams:
+      for key in self._problem_hparams.input_modality:
+        if "inputs" in key:
+          return True
+    else:
+      return True
 
   def dual_encode(self,
                   wav_inputs, txt_inputs, target_space,
@@ -57,20 +65,32 @@ class DualTransformer(Transformer):
     txt_encoder_input = tf.nn.dropout(txt_encoder_input,
                                    1.0 - hparams.layer_prepostprocess_dropout)
 
+
+    customized_wav_params=tf.contrib.training.HParams(
+      num_layers=hparams.num_wav_enc_layers,
+      ffn_layer="conv_relu_conv"
+    )
+
     wav_encoder_output = transformer_n_encoder(
       wav_encoder_input,
       wav_self_attention_bias,
-      hparams.num_wav_enc_layers,
-      hparams,name="wav_encoder",
+      hparams,
+      customize_params=customized_wav_params,
+      name="wav_encoder",
       nonpadding=features_to_nonpadding(features, "wav_inputs"),
       save_weights_to=self.attention_weights,
       losses=losses)
 
+    customized_txt_params=tf.contrib.training.HParams(
+      num_layers=hparams.num_txt_enc_layers,
+      ffn_layer=hparams.ffn_layer
+    )
     txt_encoder_output = transformer_n_encoder(
       txt_encoder_input,
       txt_self_attention_bias,
-      hparams.num_txt_enc_layers,
-      hparams, name="txt_encoder",
+      hparams,
+      customize_params=customized_txt_params,
+      name="txt_encoder",
       nonpadding=features_to_nonpadding(features, "txt_inputs"),
       save_weights_to=self.attention_weights
     )
@@ -130,7 +150,7 @@ class DualTransformer(Transformer):
     hparams = self._hparams
 
     losses = []
-
+    assert self.has_input, "problems for dual-transformer must have inputs"
     if self.has_input:
       inputs1 = features["wav_inputs"]
       inputs2 = features["txt_inputs"]
@@ -139,8 +159,8 @@ class DualTransformer(Transformer):
       txt_encoder_output, txt_enc_dec_attention_bias = self.dual_encode(
           inputs1, inputs2,target_space, hparams, features=features, losses=losses)
     else:
-      wav_encoder_output, wav_enc_dec_attention_bias,\
-      txt_encoder_output, txt_enc_dec_attention_bias = (None,None,None,None)
+      wav_encoder_output, wav_enc_dec_attention_bias, \
+      txt_encoder_output, txt_enc_dec_attention_bias=(None, None, None, None)
 
     targets = features["targets"]
     targets_shape = common_layers.shape_list(targets)
@@ -321,13 +341,13 @@ class DualTransformer(Transformer):
 
 def transformer_n_encoder(encoder_input,
                           encoder_self_attention_bias,
-                          num_layers,
-                         hparams,
-                         name="encoder",
-                         nonpadding=None,
-                         save_weights_to=None,
-                         make_image_summary=True,
-                         losses=None):
+                          hparams,
+                          customize_params,
+                          name="encoder",
+                          nonpadding=None,
+                          save_weights_to=None,
+                          make_image_summary=True,
+                          losses=None):
   """ transformer with 2 sets of encoders """
   x = encoder_input
   attention_dropout_broadcast_dims = (
@@ -343,7 +363,7 @@ def transformer_n_encoder(encoder_input,
     pad_remover = None
     if hparams.use_pad_remover and not common_layers.is_on_tpu():
       pad_remover = expert_utils.PadRemover(padding)
-    for layer in range(num_layers or
+    for layer in range(customize_params.num_layers or
                        hparams.num_hidden_layers):
       with tf.variable_scope("layer_%d" % layer):
         with tf.variable_scope("self_attention"):
@@ -365,7 +385,10 @@ def transformer_n_encoder(encoder_input,
           x = common_layers.layer_postprocess(x, y, hparams)
         with tf.variable_scope("ffn"):
           y = transformer_ffn_layer(
-            common_layers.layer_preprocess(x, hparams), hparams, pad_remover,
+            common_layers.layer_preprocess(x, hparams),
+            customized_ffn=customize_params.ffn_layer,
+            hparams=hparams,
+            pad_remover=pad_remover,
             conv_padding="SAME", nonpadding_mask=nonpadding,
             losses=losses)
           x = common_layers.layer_postprocess(x, y, hparams)
@@ -480,7 +503,7 @@ def transformer_dual_decoder(decoder_input,
               max_length=hparams.get("max_length"))
             x2 = common_layers.layer_postprocess(x, y2, hparams)
         with tf.variable_scope("ffn"):
-          if x1 is not None and x2 is not None:
+          if wav_encoder_output is not None and txt_encoder_output is not None:
             # with two encoder to attend to
             y = transformer_ffn_layer(
                 tf.concat([common_layers.layer_preprocess(x1, hparams),
@@ -639,6 +662,109 @@ def fast_decode(wav_encoder_output,
 
   return {"outputs": decoded_ids, "scores": scores}
 
+def transformer_ffn_layer(x,
+                          hparams,
+                          customized_ffn=None,
+                          pad_remover=None,
+                          conv_padding="LEFT",
+                          nonpadding_mask=None,
+                          losses=None,
+                          cache=None):
+  """Feed-forward layer in the transformer.
+
+  Args:
+    x: a Tensor of shape [batch_size, length, hparams.hidden_size]
+    hparams: hyperparameters for model
+    customized_ffn: customized the ffn_layer string
+    pad_remover: an expert_utils.PadRemover object tracking the padding
+      positions. If provided, when using convolutional settings, the padding
+      is removed before applying the convolution, and restored afterward. This
+      can give a significant speedup.
+    conv_padding: a string - either "LEFT" or "SAME".
+    nonpadding_mask: an optional Tensor with shape [batch_size, length].
+      needed for convolutional layers with "SAME" padding.
+      Contains 1.0 in positions corresponding to nonpadding.
+    losses: optional list onto which to append extra training losses
+    cache: dict, containing tensors which are the results of previous
+        attentions, used for fast decoding.
+
+  Returns:
+    a Tensor of shape [batch_size, length, hparams.hidden_size]
+
+  Raises:
+    ValueError: If losses arg is None, but layer generates extra losses.
+  """
+  ffn_layer = customized_ffn or hparams.ffn_layer
+  relu_dropout_broadcast_dims = (
+      common_layers.comma_separated_string_to_integer_list(
+          getattr(hparams, "relu_dropout_broadcast_dims", "")))
+  if ffn_layer == "conv_hidden_relu":
+    # Backwards compatibility
+    ffn_layer = "dense_relu_dense"
+  if ffn_layer == "dense_relu_dense":
+    # In simple convolution mode, use `pad_remover` to speed up processing.
+    if pad_remover:
+      original_shape = common_layers.shape_list(x)
+      # Collapse `x` across examples, and remove padding positions.
+      x = tf.reshape(x, tf.concat([[-1], original_shape[2:]], axis=0))
+      x = tf.expand_dims(pad_remover.remove(x), axis=0)
+    conv_output = common_layers.dense_relu_dense(
+        x,
+        hparams.filter_size,
+        hparams.hidden_size,
+        dropout=hparams.relu_dropout,
+        dropout_broadcast_dims=relu_dropout_broadcast_dims)
+    if pad_remover:
+      # Restore `conv_output` to the original shape of `x`, including padding.
+      conv_output = tf.reshape(
+          pad_remover.restore(tf.squeeze(conv_output, axis=0)), original_shape)
+    return conv_output
+  elif ffn_layer == "conv_relu_conv":
+    return common_layers.conv_relu_conv(
+        x,
+        hparams.filter_size,
+        hparams.hidden_size,
+        first_kernel_size=hparams.conv_first_kernel,
+        second_kernel_size=1,
+        padding=conv_padding,
+        nonpadding_mask=nonpadding_mask,
+        dropout=hparams.relu_dropout,
+        cache=cache)
+  elif ffn_layer == "parameter_attention":
+    return common_attention.parameter_attention(
+        x, hparams.parameter_attention_key_channels or hparams.hidden_size,
+        hparams.parameter_attention_value_channels or hparams.hidden_size,
+        hparams.hidden_size, hparams.filter_size, hparams.num_heads,
+        hparams.attention_dropout)
+  elif ffn_layer == "conv_hidden_relu_with_sepconv":
+    return common_layers.conv_hidden_relu(
+        x,
+        hparams.filter_size,
+        hparams.hidden_size,
+        kernel_size=(3, 1),
+        second_kernel_size=(31, 1),
+        padding="LEFT",
+        dropout=hparams.relu_dropout)
+  elif ffn_layer == "sru":
+    return common_layers.sru(x)
+  elif ffn_layer == "local_moe_tpu":
+    overhead = (hparams.moe_overhead_train
+                if hparams.mode == tf.estimator.ModeKeys.TRAIN
+                else hparams.moe_overhead_eval)
+    ret, loss = expert_utils.local_moe_tpu(
+        x, hparams.filter_size // 2,
+        hparams.hidden_size,
+        hparams.moe_num_experts, overhead=overhead,
+        loss_coef=hparams.moe_loss_coef)
+    if losses is None:
+      raise ValueError(
+          "transformer_ffn_layer with type local_moe_tpu must pass in "
+          "a losses list")
+    losses.append(loss)
+    return ret
+  else:
+    assert ffn_layer == "none"
+    return x
 
 @registry.register_hparams
 def dual_transformer_nst():
@@ -648,7 +774,7 @@ def dual_transformer_nst():
   hparams.hidden_size = 512
   hparams.batch_size = 8e6
 
-  hparams.max_length = 1650*80 # this limits inputs[1] * inputs[2]
+  hparams.max_length = 1650*80 # this limits inputs[1] * inputs[2] given to transformer parts
   hparams.add_hparam("max_wav_seq_length", 0)
   hparams.add_hparam("max_txt_seq_length", 0)
   hparams.max_target_seq_length = 200
@@ -673,16 +799,17 @@ def dual_transformer_nst():
   hparams.symbol_modality_num_shards = 16
   hparams.layer_preprocess_sequence = "n"
   hparams.layer_postprocess_sequence = "da"
+  hparams.daisy_chain_variables = False  # data parallelism
 
-  # Add new ones like this.
-  hparams.add_hparam("filter_size", 4096)
+# Add new ones like this.
+  hparams.add_hparam("filter_size", 2048)
   # Layer-related flags. If zero, these fall back on hparams.num_hidden_layers.
   hparams.add_hparam("num_wav_enc_layers", 0)
   hparams.add_hparam("num_txt_enc_layers", 0)
   hparams.add_hparam("num_decoder_layers", 0)
 
   # Attention-related flags.
-  hparams.add_hparam("num_heads", 16)
+  hparams.add_hparam("num_heads", 8)
   hparams.add_hparam("attention_key_channels", 0)
   hparams.add_hparam("attention_value_channels", 0)
   hparams.add_hparam("ffn_layer", "dense_relu_dense")
@@ -691,6 +818,7 @@ def dual_transformer_nst():
 
   # All hyperparameters ending in "dropout" are automatically set to 0.0
   # when not in training mode.
+  hparams.layer_prepostprocess_dropout = 0.1
   hparams.add_hparam("attention_dropout", 0.1)
   hparams.add_hparam("attention_dropout_broadcast_dims", "")
   hparams.add_hparam("relu_dropout", 0.1)
@@ -701,7 +829,7 @@ def dual_transformer_nst():
   hparams.add_hparam("use_pad_remover", True)
   hparams.add_hparam("self_attention_type", "dot_product")
   hparams.add_hparam("max_relative_position", 0)
-  hparams.add_hparam("conv_first_kernel", 3)
+  hparams.add_hparam("conv_first_kernel", 9)
   # These parameters are only used when ffn_layer=="local_moe_tpu"
   hparams.add_hparam("moe_overhead_train", 1.0)
   hparams.add_hparam("moe_overhead_eval", 2.0)
