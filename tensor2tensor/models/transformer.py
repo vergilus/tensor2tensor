@@ -25,7 +25,10 @@ description of the model and the results obtained with its early version.
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+
+import tensorflow as tf
 from six.moves import range  # pylint: disable=redefined-builtin
+from tensorflow.python.util import nest
 
 from tensor2tensor.data_generators import librispeech
 from tensor2tensor.layers import common_attention
@@ -35,10 +38,6 @@ from tensor2tensor.utils import beam_search
 from tensor2tensor.utils import expert_utils
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import t2t_model
-
-import tensorflow as tf
-
-from tensorflow.python.util import nest
 
 
 @registry.register_model
@@ -631,7 +630,7 @@ def features_to_nonpadding(features, inputs_or_targets="inputs"):
   return None
 
 
-def transformer_prepare_encoder(inputs, target_space, hparams, features=None):
+def transformer_prepare_encoder(inputs, target_space, hparams, features=None,reuse_trg=None):
   """Prepare one shard of the model for the encoder.
 
   Args:
@@ -676,6 +675,7 @@ def transformer_prepare_encoder(inputs, target_space, hparams, features=None):
       32,
       ishape_static[-1],
       name="target_space_embedding",
+      reuse=reuse_trg,
       dtype=tf.bfloat16 if hparams.activation_dtype == "bfloat16"
       else tf.float32)
   emb_target_space = tf.reshape(emb_target_space, [1, 1, -1])
