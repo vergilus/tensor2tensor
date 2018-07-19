@@ -72,7 +72,7 @@ def _collect_data(directory, in_wav_ext, in_txt_ext, trg_ext):
         open(trg_txt_path, "r") as trg_txt_file :
         for line in in_txt_file:
           target = trg_txt_file.readline()
-          line_content = line.strip().split(" ", 1)
+          line_content = line.lower().strip().split(" ", 1)
           media_base, txt_input = line_content
           key = os.path.join(root, media_base)
           assert key not in data_files

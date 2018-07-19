@@ -61,14 +61,15 @@ class DualTransformer(Transformer):
 
     txt_encoder_input, txt_self_attention_bias, txt_encoder_decoder_attention_bias = (
       transformer_prepare_encoder(
-        txt_inputs, target_space, hparams, features=features))
+        txt_inputs, target_space, hparams, features=features, reuse_trg=True))
     txt_encoder_input = tf.nn.dropout(txt_encoder_input,
                                    1.0 - hparams.layer_prepostprocess_dropout)
 
 
     customized_wav_params=tf.contrib.training.HParams(
-      num_layers=hparams.num_wav_enc_layers,
-      ffn_layer="conv_relu_conv"
+      num_layers=hparams.get("num_wav_enc_layers"),
+      ffn_layer="conv_relu_conv",
+      max_length=hparams.get("max_length") #or hparams.max_wav_seq_length*80 # for the wav_enc, we have mel-bins
     )
 
     wav_encoder_output = transformer_n_encoder(
@@ -82,8 +83,9 @@ class DualTransformer(Transformer):
       losses=losses)
 
     customized_txt_params=tf.contrib.training.HParams(
-      num_layers=hparams.num_txt_enc_layers,
-      ffn_layer=hparams.ffn_layer
+      num_layers=hparams.get("num_txt_enc_layers"),
+      ffn_layer=hparams.get("ffn_layer"),
+      max_length=hparams.get("max_txt_seq_length") #or  hparams.get("max_txt_seq_length")
     )
     txt_encoder_output = transformer_n_encoder(
       txt_encoder_input,
@@ -381,7 +383,7 @@ def transformer_n_encoder(encoder_input,
             max_relative_position=hparams.max_relative_position,
             make_image_summary=make_image_summary,
             dropout_broadcast_dims=attention_dropout_broadcast_dims,
-            max_length=hparams.get("max_length"))
+            max_length=customize_params.get("max_length"))
           x = common_layers.layer_postprocess(x, y, hparams)
         with tf.variable_scope("ffn"):
           y = transformer_ffn_layer(
@@ -468,7 +470,7 @@ def transformer_dual_decoder(decoder_input,
               cache=layer_cache,
               make_image_summary=make_image_summary,
               dropout_broadcast_dims=attention_dropout_broadcast_dims,
-              max_length=hparams.get("max_length"))
+              max_length=hparams.get("max_target_seq_length")) #
           x = common_layers.layer_postprocess(x, y, hparams)
         if wav_encoder_output is not None:
           with tf.variable_scope("wav_encdec_attention"):
@@ -484,7 +486,7 @@ def transformer_dual_decoder(decoder_input,
                 save_weights_to=save_weights_to,
                 make_image_summary=make_image_summary,
                 dropout_broadcast_dims=attention_dropout_broadcast_dims,
-                max_length=hparams.get("max_length"))
+                max_length=hparams.get("max_length") ) #"max_wav_seq_length")*80
             x1 = common_layers.layer_postprocess(x, y1, hparams)
         if txt_encoder_output is not None:
           with tf.variable_scope("txt_encdec_attention"):
@@ -500,7 +502,7 @@ def transformer_dual_decoder(decoder_input,
               save_weights_to=save_weights_to,
               make_image_summary=make_image_summary,
               dropout_broadcast_dims=attention_dropout_broadcast_dims,
-              max_length=hparams.get("max_length"))
+              max_length=hparams.get("max_txt_seq_length") )#max_txt_seq_length
             x2 = common_layers.layer_postprocess(x, y2, hparams)
         with tf.variable_scope("ffn"):
           if wav_encoder_output is not None and txt_encoder_output is not None:
@@ -775,9 +777,10 @@ def dual_transformer_nst():
   hparams.batch_size = 8e6
 
   hparams.max_length = 1650*80 # this limits inputs[1] * inputs[2] given to transformer parts
-  hparams.add_hparam("max_wav_seq_length", 0)
-  hparams.add_hparam("max_txt_seq_length", 0)
-  hparams.max_target_seq_length = 200
+  # max_*_seq_length is used to truncate input labels, this also requires more memory
+  hparams.add_hparam("max_wav_seq_length", 0)# falls back to max_length in attention if not set
+  hparams.add_hparam("max_txt_seq_length", 256)# falls back to max_length in attention if not set
+  hparams.max_target_seq_length = 256
 
   hparams.clip_grad_norm = 0.  # i.e. no gradient clipping
   hparams.learning_rate_schedule = (
@@ -799,6 +802,11 @@ def dual_transformer_nst():
   hparams.symbol_modality_num_shards = 16
   hparams.layer_preprocess_sequence = "n"
   hparams.layer_postprocess_sequence = "da"
+
+  hparams.layer_prepostprocess_dropout = 0.1
+  hparams.attention_dropout = 0.1
+  hparams.relu_dropout = 0.1
+
   hparams.daisy_chain_variables = False  # data parallelism
 
 # Add new ones like this.
