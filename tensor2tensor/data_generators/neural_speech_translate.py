@@ -56,7 +56,7 @@ def _collect_data(directory, in_wav_ext, in_txt_ext, trg_ext):
   # Directory from string to triplets of strings
   # key: the filepath to a datafile including the datafile's basename
   #   if the datafile was "/path/to/datafile.wav" then the key would be
-  #   "/path/to/datafile" ( *.wav, *trans.txt, *tmp.txt;)
+  #   "/path/to/datafile" ( *.wav, *trans.txt, *tmp.txt, *pinyin.txt;)
   # value: a triplet of strings (media_filepath, label)
   data_files = dict()
   for root, _, filenames in os.walk(directory):
@@ -106,7 +106,7 @@ class NeuralSpeechTranslate(problem.Problem):
 
   @property
   def approx_vocab_size(self):
-    return 2**15
+    return 2**10
 
   @property
   def target_vocab_name(self):
@@ -194,8 +194,8 @@ class NeuralSpeechTranslate(problem.Problem):
     filename_base = "nst_enzh_%sk_tok_%s" % (self.approx_vocab_size, "train")
     """collect training Files to be passed to generate vocab(src)"""
     src_file_name=self.compile_data(tmp_dir, "train", filename_base+".lang1", file_ext="trans.txt")
-    """collect training Files to be passed to generate vocab(trg)"""
-    trg_file_name=self.compile_data(tmp_dir, "train", filename_base+".lang2", file_ext="tmp.txt" )
+    """collect training Files to be passed to generate vocab(trg),(*pinyin.txt or *tmp.txt)"""
+    trg_file_name=self.compile_data(tmp_dir, "train", filename_base+".lang2", file_ext="pinyin.txt" )
 
     def traverse_samples(filepath, file_byte_budget):
       with tf.gfile.GFile(filepath, mode="r") as source_file:
@@ -251,7 +251,8 @@ class NeuralSpeechTranslate(problem.Problem):
 
       tmp_data_dir = os.path.join(tmp_dir, "LibriSpeech", subdir)
       # here we need extra translated results from other src: saved in *.tmp.txt
-      data_files = _collect_data(tmp_data_dir, "flac", "trans.txt", "tmp.txt")
+      # or we can extract from *pinyin.txt
+      data_files = _collect_data(tmp_data_dir, "flac", "trans.txt", "pinyin.txt")
       data_triplets = data_files.values()
 
       audio_encoder = self._encoders["wav_inputs"]
@@ -346,9 +347,11 @@ class NeuralSpeechTranslate(problem.Problem):
     # preprocess example['inputs', 'batch_prediction_key', 'targets' ]
     example["waveforms"] = example["wav_inputs"]
     if p.audio_preproc_in_bottom:
+      # this is batched preprocess examples using GPU(faster)
       example["wav_inputs"] = tf.expand_dims(
         tf.expand_dims(example["waveforms"], -1), -1)
     else:
+      # this is sample-wise preprocess examples using CPU(slower)
       waveforms = tf.expand_dims(example["waveforms"], 0)
       mel_fbanks = compute_mel_filterbank_features(
         waveforms,
@@ -365,16 +368,22 @@ class NeuralSpeechTranslate(problem.Problem):
         mel_fbanks = add_delta_deltas(mel_fbanks)
       fbank_size = common_layers.shape_list(mel_fbanks)
       assert fbank_size[0] == 1
+      # frame concatenation
+      if p.concat_frame:
+        mel_fbanks = tf.pad(mel_fbanks,[[0, 0], [0, tf.mod(-fbank_size[1], p.concat_frame)], [0, 0] ])
+        mel_fbanks = tf.reshape(mel_fbanks, [1,
+                           common_layers.shape_list(mel_fbanks)[1]/p.concat_frame,
+                           common_layers.shape_list(mel_fbanks)[2]*p.concat_frame])
 
       # This replaces CMVN estimation on data
       mean = tf.reduce_mean(mel_fbanks, keepdims=True, axis=1)
       variance = tf.reduce_mean((mel_fbanks - mean) ** 2, keepdims=True, axis=1)
-      mel_fbanks = (mel_fbanks - mean) / variance
-
+      mel_fbanks_final = (mel_fbanks - mean) / variance
+      fbank_size = common_layers.shape_list(mel_fbanks_final)
       # Later models like to flatten the two spatial dims. Instead, we add a
       # unit spatial dim and flatten the frequencies and channels.
       example["wav_inputs"] = tf.concat([
-        tf.reshape(mel_fbanks, [fbank_size[1], fbank_size[2], fbank_size[3]]),
+        tf.reshape(mel_fbanks_final, [fbank_size[1], fbank_size[2], fbank_size[3]]),
         tf.zeros((p.num_zeropad_frames, fbank_size[2], fbank_size[3]))], 0)
     if not p.audio_keep_example_waveforms:
       del example["waveforms"]

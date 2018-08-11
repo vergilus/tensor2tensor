@@ -20,11 +20,13 @@ it as appropriate (e.g. using apt-get or yum).
 
 import functools
 import os
-from subprocess import call
 import tempfile
+from subprocess import call
+
 import numpy as np
-from scipy.io import wavfile
 import scipy.signal
+import tensorflow as tf
+from scipy.io import wavfile
 
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
@@ -33,8 +35,6 @@ from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import metrics
 from tensor2tensor.utils import modality
 from tensor2tensor.utils import registry
-
-import tensorflow as tf
 
 
 #
@@ -310,7 +310,6 @@ class SpeechRecognitionProblem(problem.Problem):
       assert fbank_size[0] == 1
 
       # This replaces CMVN estimation on data
-
       mean = tf.reduce_mean(mel_fbanks, keepdims=True, axis=1)
       variance = tf.reduce_mean((mel_fbanks-mean)**2, keepdims=True, axis=1)
       mel_fbanks = (mel_fbanks - mean) / variance
@@ -368,12 +367,25 @@ class SpeechRecognitionModality(modality.Modality):
               apply_mask=True)
           if p.audio_add_delta_deltas:
             mel_fbanks = add_delta_deltas(mel_fbanks)
-          x = tf.reshape(mel_fbanks,
-                         common_layers.shape_list(mel_fbanks)[:2] +
-                         [num_mel_bins, num_channels])
+          # frame concatenation
+          if p.concat_frame:
+            fbank_size=common_layers.shape_list(mel_fbanks)
+            x = tf.pad(mel_fbanks, [[0, 0], [0, tf.mod(-fbank_size[1],p.concat_frame)], [0, 0], [0, 0]])
+            x = tf.reshape(x,
+                           [fbank_size[0],
+                            common_layers.shape_list(x)[1]/p.concat_frame,
+                            num_mel_bins*p.concat_frame, num_channels])
+          else:
+            x = tf.reshape(mel_fbanks,
+                           common_layers.shape_list(mel_fbanks)[:2]+
+                           [num_mel_bins, num_channels])
 
           nonpadding_mask = 1. - common_attention.embedding_to_padding(x)
-          num_of_nonpadding_elements = tf.reduce_sum(
+          if p.concat_frame:
+            num_of_nonpadding_elements = tf.reduce_sum(
+              nonpadding_mask) *num_mel_bins*num_channels/p.concat_frame
+          else:
+            num_of_nonpadding_elements = tf.reduce_sum(
               nonpadding_mask) * num_mel_bins * num_channels
 
           # This replaces CMVN estimation on data
@@ -390,7 +402,10 @@ class SpeechRecognitionModality(modality.Modality):
       # The convention is that the models are flattened along the spatial,
       # dimensions, thus the speech preprocessor treats frequencies and
       # channels as image colors (last axis)
-      x.set_shape([None, None, num_mel_bins, num_channels])
+      if p.concat_frame:
+        x.set_shape([None, None, num_mel_bins*p.concat_frame, num_channels])
+      else:
+        x.set_shape([None, None, num_mel_bins, num_channels])
 
       # TODO(chorowski): how to specify bottom's hparams and avoid hardcoding?
       x = tf.pad(x, [[0, 0], [0, 8], [0, 0], [0, 0]])

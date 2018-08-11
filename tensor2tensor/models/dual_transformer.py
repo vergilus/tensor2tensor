@@ -67,6 +67,7 @@ class DualTransformer(Transformer):
 
 
     customized_wav_params=tf.contrib.training.HParams(
+      num_heads=hparams.get("wav_num_heads"),
       num_layers=hparams.get("num_wav_enc_layers"),
       ffn_layer="conv_relu_conv",
       max_length=hparams.get("max_length") #or hparams.max_wav_seq_length*80 # for the wav_enc, we have mel-bins
@@ -83,8 +84,9 @@ class DualTransformer(Transformer):
       losses=losses)
 
     customized_txt_params=tf.contrib.training.HParams(
+      num_heads=hparams.get("txt_num_heads"),
       num_layers=hparams.get("num_txt_enc_layers"),
-      ffn_layer=hparams.get("ffn_layer"),
+      ffn_layer="dense_relu_dense",
       max_length=hparams.get("max_txt_seq_length") #or  hparams.get("max_txt_seq_length")
     )
     txt_encoder_output = transformer_n_encoder(
@@ -376,7 +378,7 @@ def transformer_n_encoder(encoder_input,
             hparams.attention_key_channels or hparams.hidden_size,
             hparams.attention_value_channels or hparams.hidden_size,
             hparams.hidden_size,
-            hparams.num_heads,
+            customize_params.num_heads or hparams.num_heads,
             hparams.attention_dropout,
             attention_type=hparams.self_attention_type,
             save_weights_to=save_weights_to,
@@ -481,7 +483,7 @@ def transformer_dual_decoder(decoder_input,
                 hparams.attention_key_channels or hparams.hidden_size,
                 hparams.attention_value_channels or hparams.hidden_size,
                 hparams.hidden_size,
-                hparams.num_heads,
+                hparams.wav_num_heads or hparams.num_heads,
                 hparams.attention_dropout,
                 save_weights_to=save_weights_to,
                 make_image_summary=make_image_summary,
@@ -497,7 +499,7 @@ def transformer_dual_decoder(decoder_input,
               hparams.attention_key_channels or hparams.hidden_size,
               hparams.attention_value_channels or hparams.hidden_size,
               hparams.hidden_size,
-              hparams.num_heads,
+              hparams.txt_num_heads or hparams.num_heads,
               hparams.attention_dropout,
               save_weights_to=save_weights_to,
               make_image_summary=make_image_summary,
@@ -508,13 +510,13 @@ def transformer_dual_decoder(decoder_input,
           if wav_encoder_output is not None and txt_encoder_output is not None:
             # with two encoder to attend to
             y = transformer_ffn_layer(
-                tf.concat([common_layers.layer_preprocess(x1, hparams),
-                           common_layers.layer_preprocess(x2, hparams)],axis=-1),
-                hparams,
-                conv_padding="LEFT",
-                nonpadding_mask=nonpadding,
-                losses=losses,
-                cache=layer_cache)
+              common_layers.layer_preprocess(tf.concat([x1,x2],axis=-1),
+                                             hparams),
+              hparams,
+              conv_padding="LEFT",
+              nonpadding_mask=nonpadding,
+              losses=losses,
+              cache=layer_cache)
           else:
             y = transformer_ffn_layer(
               common_layers.layer_preprocess(x, hparams),
@@ -617,8 +619,8 @@ def fast_decode(wav_encoder_output,
     else:
       decoded_ids = decoded_ids[:, :top_beams, 1:]
       scores = scores[:, :top_beams]
-  else: # TODO: Greedy search
-    pass
+  else: # Greedy search
+    # pass
     def inner_loop(i, hit_eos, next_id, decoded_ids, cache, log_prob):
       """One step of greedy decoding."""
       logits, cache = symbols_to_logits_fn(next_id, i, cache)
@@ -773,64 +775,67 @@ def dual_transformer_nst():
   """ set of hyperparameters. """
   hparams = common_hparams.basic_params1() # training parameters
   hparams.norm_type = "layer"
-  hparams.hidden_size = 512
-  hparams.batch_size = 8e6
+  hparams.hidden_size = 384
+  hparams.batch_size = 8000000
 
-  hparams.max_length = 1650*80 # this limits inputs[1] * inputs[2] given to transformer parts
+  hparams.max_length = 1500000 # this limits inputs[1] * inputs[2] given to transformer parts
   # max_*_seq_length is used to truncate input labels, this also requires more memory
   hparams.add_hparam("max_wav_seq_length", 0)# falls back to max_length in attention if not set
-  hparams.add_hparam("max_txt_seq_length", 256)# falls back to max_length in attention if not set
-  hparams.max_target_seq_length = 256
+  hparams.add_hparam("max_txt_seq_length", 2500)# falls back to max_length in attention if not set
+  hparams.max_target_seq_length = 0
+  hparams.add_hparam("concat_frame", 4)# 0 means no frame-concat
 
   hparams.clip_grad_norm = 0.  # i.e. no gradient clipping
-  hparams.learning_rate_schedule = (
-      "constant*linear_warmup*rsqrt_decay*rsqrt_hidden_size")
   hparams.learning_rate_constant = 2.0
   hparams.learning_rate_decay_scheme = "noam"
-  hparams.learning_rate = 0.2
+  hparams.learning_rate = 0.15
   hparams.learning_rate_warmup_steps = 10000
   hparams.initializer_gain = 1.0
-  hparams.num_hidden_layers = 6
   hparams.initializer = "uniform_unit_scaling"
   hparams.weight_decay = 0.0
+  hparams.optimizer = "Adafactor"
+  hparams.learning_rate_schedule = "rsqrt_decay"
+  # hparams.learning_rate_schedule = (
+  #     "constant*linear_warmup*rsqrt_decay*rsqrt_hidden_size")
   hparams.optimizer_adam_epsilon = 1e-9
   hparams.optimizer_adam_beta1 = 0.9
-  hparams.optimizer_adam_beta2 = 0.997
+  # hparams.optimizer_adam_beta2 = 0.997
   hparams.num_sampled_classes = 0
   hparams.label_smoothing = 0.1
   hparams.shared_embedding_and_softmax_weights = True
-  hparams.symbol_modality_num_shards = 16
+  hparams.symbol_modality_num_shards = 1
   hparams.layer_preprocess_sequence = "n"
   hparams.layer_postprocess_sequence = "da"
-
-  hparams.layer_prepostprocess_dropout = 0.1
-  hparams.attention_dropout = 0.1
-  hparams.relu_dropout = 0.1
 
   hparams.daisy_chain_variables = False  # data parallelism
 
 # Add new ones like this.
-  hparams.add_hparam("filter_size", 2048)
+  hparams.add_hparam("filter_size", 1536)
   # Layer-related flags. If zero, these fall back on hparams.num_hidden_layers.
+  hparams.num_hidden_layers = 4
   hparams.add_hparam("num_wav_enc_layers", 0)
-  hparams.add_hparam("num_txt_enc_layers", 0)
+  hparams.add_hparam("num_txt_enc_layers", 6)
   hparams.add_hparam("num_decoder_layers", 0)
 
   # Attention-related flags.
-  hparams.add_hparam("num_heads", 8)
+  hparams.add_hparam("num_heads", 6)
+  # multi-head attention setings, falls back to num_heads if 0
+  hparams.add_hparam("wav_num_heads", 3)
+  hparams.add_hparam("txt_num_heads", 0)
   hparams.add_hparam("attention_key_channels", 0)
   hparams.add_hparam("attention_value_channels", 0)
-  hparams.add_hparam("ffn_layer", "dense_relu_dense")
+  hparams.add_hparam("ffn_layer", "conv_relu_conv")
   hparams.add_hparam("parameter_attention_key_channels", 0)
   hparams.add_hparam("parameter_attention_value_channels", 0)
 
   # All hyperparameters ending in "dropout" are automatically set to 0.0
   # when not in training mode.
-  hparams.layer_prepostprocess_dropout = 0.1
-  hparams.add_hparam("attention_dropout", 0.1)
-  hparams.add_hparam("attention_dropout_broadcast_dims", "")
-  hparams.add_hparam("relu_dropout", 0.1)
-  hparams.add_hparam("relu_dropout_broadcast_dims", "")
+  hparams.layer_prepostprocess_dropout = 0.2
+  hparams.layer_prepostprocess_dropout_broadcast_dims="1"
+  hparams.attention_dropout = 0.1
+  hparams.relu_dropout = 0.2
+  hparams.add_hparam("attention_dropout_broadcast_dims", "0,1")
+  hparams.add_hparam("relu_dropout_broadcast_dims", "1")
   hparams.add_hparam("pos", "timing")  # timing, none
   hparams.add_hparam("nbr_decoder_problems", 1)
   hparams.add_hparam("proximity_bias", False)
