@@ -25,15 +25,15 @@ import random
 import stat
 import tarfile
 import tempfile
+
 import requests
 import six
-from six.moves import range  # pylint: disable=redefined-builtin
 # Imports urllib on Python2, urllib.request on Python3
 import six.moves.urllib_request as urllib
+import tensorflow as tf
+from six.moves import range  # pylint: disable=redefined-builtin
 
 from tensor2tensor.data_generators import text_encoder
-
-import tensorflow as tf
 
 UNSHUFFLED_SUFFIX = "-unshuffled"
 
@@ -387,7 +387,7 @@ def get_or_generate_vocab(data_dir, tmp_dir, vocab_filename, vocab_size,
               yield line
 
   return get_or_generate_vocab_inner(data_dir, vocab_filename, vocab_size,
-                                     generate())
+                                     generate(), max_subtoken_length=18)
 
 
 def get_or_generate_tabbed_vocab(data_dir, tmp_dir, source_filename,
