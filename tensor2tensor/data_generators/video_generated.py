@@ -20,28 +20,25 @@ from __future__ import print_function
 
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from tensor2tensor.data_generators import video_utils
+from tensor2tensor.utils import metrics
 from tensor2tensor.utils import registry
 
 import tensorflow as tf
+
+try:
+  import matplotlib  # pylint: disable=g-import-not-at-top
+  matplotlib.use("agg")
+  import matplotlib.pyplot as plt  # pylint: disable=g-import-not-at-top
+except ImportError:
+  pass
 
 
 @registry.register_problem
 class VideoStochasticShapes10k(video_utils.VideoProblem):
   """Shapes moving in a stochastic way."""
-
-  @property
-  def num_input_frames(self):
-    """Number of frames to batch on one input."""
-    return 4
-
-  @property
-  def num_target_frames(self):
-    """Number of frames to predict in one step."""
-    return 1
 
   @property
   def is_generate_per_split(self):
@@ -58,11 +55,21 @@ class VideoStochasticShapes10k(video_utils.VideoProblem):
 
   @property
   def total_number_of_frames(self):
-    return 10000
+    # 10k videos
+    return 10000 * self.video_length
 
   @property
   def video_length(self):
     return 5
+
+  @property
+  def random_skip(self):
+    return False
+
+  def eval_metrics(self):
+    eval_metrics = [metrics.Metrics.ACC, metrics.Metrics.ACC_PER_SEQ,
+                    metrics.Metrics.IMAGE_RMSE]
+    return eval_metrics
 
   @property
   def extra_reading_spec(self):
@@ -82,7 +89,9 @@ class VideoStochasticShapes10k(video_utils.VideoProblem):
         "inputs": ("video", 256),
         "input_frame_number": ("symbol:identity", 1)
     }
-    p.target_modality = ("video", 256)
+    p.target_modality = {
+        "targets": ("video", 256),
+    }
 
   @staticmethod
   def get_circle(x, y, z, c, s):
@@ -126,11 +135,11 @@ class VideoStochasticShapes10k(video_utils.VideoProblem):
                           [-1.0, -1.0]
                          ])
 
-    rnd = np.random.randint(len(direction))
     sp = np.array([lim/2.0, lim/2.0])
+    rnd = np.random.randint(len(direction))
     di = direction[rnd]
 
-    colors = ["b", "g", "r", "c", "m", "y", "k"]
+    colors = ["b", "g", "r", "c", "m", "y"]
     color = np.random.choice(colors)
 
     shape = np.random.choice([
@@ -145,7 +154,6 @@ class VideoStochasticShapes10k(video_utils.VideoProblem):
     plt.ioff()
 
     xy = np.array(sp)
-    di = direction[0]
 
     for _ in range(self.video_length):
       fig = plt.figure()
@@ -172,14 +180,14 @@ class VideoStochasticShapes10k(video_utils.VideoProblem):
       yield image
 
   def generate_samples(self, data_dir, tmp_dir, unused_dataset_split):
-    frame_number = 0
+    counter = 0
     done = False
     while not done:
       for frame_number, frame in enumerate(
           self.generate_stochastic_shape_instance()):
-        if frame_number >= self.total_number_of_frames:
+        if counter >= self.total_number_of_frames:
           done = True
           break
 
         yield {"frame": frame, "frame_number": [frame_number]}
-        frame_number += 1
+        counter += 1

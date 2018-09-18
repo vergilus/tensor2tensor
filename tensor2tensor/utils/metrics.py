@@ -23,7 +23,6 @@ import six
 
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import bleu_hook
-from tensor2tensor.utils import registry
 from tensor2tensor.utils import rouge
 
 import tensorflow as tf
@@ -33,10 +32,11 @@ from tensorflow.contrib.eager.python import tfe
 
 class Metrics(object):
   """Available evaluation metrics."""
-  # Entries here should match the keys in METRICS_FN below
+  # Entries here should match the keys in METRICS_FNS below
   ACC = "accuracy"
   ACC_TOP5 = "accuracy_top5"
   ACC_PER_SEQ = "accuracy_per_sequence"
+  ACC_MULTILABEL_MATCH3 = "accuracy_multilabel_match3"
   NEG_LOG_PERPLEXITY = "neg_log_perplexity"
   APPROX_BLEU = "approx_bleu_score"
   RMSE = "rmse"
@@ -54,6 +54,8 @@ class Metrics(object):
   SIGMOID_CROSS_ENTROPY_ONE_HOT = "sigmoid_cross_entropy_one_hot"
   ROC_AUC = "roc_auc"
   IMAGE_SUMMARY = "image_summary"
+  DMOL_PERPLEXITY = "disc_mol_neg_log_perplexity"
+  ABS_ERR = "mean_absolute_error"
   IMAGE_RMSE = "image_rmse"
 
 
@@ -72,8 +74,17 @@ def padded_rmse(predictions, labels, weights_fn=common_layers.weights_all):
   predictions, labels = common_layers.pad_with_zeros(predictions, labels)
   weights = weights_fn(labels)
   error = tf.pow(predictions - labels, 2)
-  error_sqrt = tf.sqrt(tf.reduce_sum(error * weights))
+  error_sqrt = tf.sqrt(tf.reduce_mean(error * weights))
   return error_sqrt, tf.reduce_sum(weights)
+
+
+def abs_error(predictions, labels, weights_fn=None):
+  """Computes mean(abs(preds-target))."""
+  del weights_fn  # Unused
+  targets = tf.squeeze(labels, axis=[2, 3])
+  batch_abs_error = tf.abs(predictions - targets)
+  den = tf.ones(tf.shape(batch_abs_error), dtype=tf.float32)
+  return (batch_abs_error, den)
 
 
 def padded_log_poisson(predictions,
@@ -232,6 +243,16 @@ def padded_neg_log_perplexity(predictions,
   return (-num, den)
 
 
+def dmol_neg_log_perplexity(predictions,
+                            labels,
+                            weights_fn=None):
+  """Average log-perplexity excluding padding 0s. No smoothing."""
+  del weights_fn  # Unused
+  num, den = common_layers.dml_loss(
+      predictions, labels, reduce_sum=False)
+  return (-num, den)
+
+
 def rounding_accuracy(predictions,
                       labels,
                       weights_fn=common_layers.weights_nonzero):
@@ -257,6 +278,44 @@ def padded_accuracy(predictions,
     outputs = tf.to_int32(tf.argmax(padded_predictions, axis=-1))
     padded_labels = tf.to_int32(padded_labels)
     return tf.to_float(tf.equal(outputs, padded_labels)), weights
+
+
+def multilabel_accuracy_matchk(predictions,
+                               labels,
+                               k,
+                               weights_fn=common_layers.weights_nonzero):
+  """Used to evaluate the VQA accuracy.
+
+  Let n be the times that predictions appear in labels, then final score
+  is min(n/k, 1).
+  Refer to https://arxiv.org/pdf/1505.00468.pdf.
+
+  Args:
+    predictions: A tensor with shape [batch_size, 1, 1, 1, vocab_size].
+    labels: A tensor with shape [batch_size, length, 1, 1].
+    k: A tensor constant.
+    weights_fn: weight function.
+  Returns:
+    scores: min(n/k, 1).
+    weights: returns all ones.
+
+  """
+  predictions = tf.to_int32(tf.argmax(predictions, axis=-1))
+  scores = tf.to_float(tf.equal(predictions, labels))
+  # those label == 0 do not count
+  weights = weights_fn(labels)
+  scores *= weights
+  scores = tf.reduce_sum(scores, axis=[1, 2, 3])
+  scores = tf.minimum(scores / tf.to_float(k), 1)
+  # every sample count
+  weights = tf.ones(tf.shape(scores), dtype=tf.float32)
+
+  return scores, weights
+
+
+def multilabel_accuracy_match3(predictions, labels,
+                               weights_fn=common_layers.weights_nonzero):
+  return multilabel_accuracy_matchk(predictions, labels, 3, weights_fn)
 
 
 def set_precision(predictions, labels,
@@ -465,11 +524,13 @@ def create_evaluation_metrics(problems, model_hparams):
     """Reduce dimensions for high-dimensional predictions and labels."""
     # We will treat first dimensions as batch. One example are video frames.
     if len(predictions.get_shape()) > 5:
+      predictions_shape = common_layers.shape_list(predictions)
       predictions = tf.reshape(
-          predictions, [-1] + common_layers.shape_list(predictions)[-4:])
-    if len(labels.get_shape()) > 4:
+          predictions, [predictions_shape[0], predictions_shape[1], -1,
+                        predictions_shape[-1]])
+      labels_shape = common_layers.shape_list(labels)
       labels = tf.reshape(
-          labels, [-1] + common_layers.shape_list(labels)[-3:])
+          labels, [labels_shape[0], labels_shape[1], -1])
     return predictions, labels
 
   def make_problem_specific_metric_fn(metric_fn, weights_fn):
@@ -506,10 +567,15 @@ def create_evaluation_metrics(problems, model_hparams):
 
     return image_wrapped_metric_fn
 
+  def weights_fn_for_mp(problem_task_id):
+    return lambda x: common_layers.weights_multi_problem(x, problem_task_id)
+
   eval_metrics = dict()
   for problem_instance in problems:
     problem_name = problem_instance.name
     metrics = problem_instance.eval_metrics()
+    if hasattr(model_hparams.problem, "task_list"):
+      metrics = model_hparams.problem.eval_metrics()
     if not all([m in METRICS_FNS for m in metrics]):
       error_str = ("Unrecognized metric. Problem %s specified metrics "
                    "%s. Recognized metrics are %s.")
@@ -517,14 +583,15 @@ def create_evaluation_metrics(problems, model_hparams):
                                     metrics,
                                     list(METRICS_FNS.keys())))
 
-    tm = problem_instance.get_hparams().target_modality
+    tm = problem_instance.get_hparams(model_hparams).target_modality
     if not isinstance(tm, dict):
       tm = {"targets": tm}
 
     for target_name, modality in six.iteritems(tm):
-      if isinstance(modality, tuple):
-        modality = registry.create_modality(modality, model_hparams)
       weights_fn = modality.targets_weights_fn
+      if hasattr(model_hparams.problem, "task_list"):
+        ptid = problem_instance.task_id  # pylint: disable=cell-var-from-loop
+        weights_fn = weights_fn_for_mp(ptid)
 
       for metric in metrics:
         metric_fn = METRICS_FNS[metric]
@@ -538,13 +605,10 @@ def create_evaluation_metrics(problems, model_hparams):
   return eval_metrics
 
 
-def create_eager_metrics_for_problem(problem, model_hparams=None):
+def create_eager_metrics_for_problem(problem, model_hparams):
   """See create_eager_metrics."""
   metric_names = problem.eval_metrics()
-  tm = problem.get_hparams().target_modality
-  if isinstance(tm, tuple):
-    assert model_hparams is not None
-    tm = registry.create_modality(tm, model_hparams)
+  tm = problem.get_hparams(model_hparams).target_modality
   return create_eager_metrics(metric_names, weights_fn=tm.targets_weights_fn)
 
 
@@ -592,6 +656,7 @@ METRICS_FNS = {
     Metrics.ACC: padded_accuracy,
     Metrics.ACC_TOP5: padded_accuracy_top5,
     Metrics.ACC_PER_SEQ: padded_sequence_accuracy,
+    Metrics.ACC_MULTILABEL_MATCH3: multilabel_accuracy_match3,
     Metrics.NEG_LOG_PERPLEXITY: padded_neg_log_perplexity,
     Metrics.APPROX_BLEU: bleu_hook.bleu_score,
     Metrics.RMSE: padded_rmse,
@@ -609,5 +674,7 @@ METRICS_FNS = {
     Metrics.SET_RECALL: set_recall,
     Metrics.ROC_AUC: roc_auc,
     Metrics.IMAGE_SUMMARY: image_summary,
+    Metrics.DMOL_PERPLEXITY: dmol_neg_log_perplexity,
+    Metrics.ABS_ERR: abs_error,
     Metrics.IMAGE_RMSE: image_rmse,
 }

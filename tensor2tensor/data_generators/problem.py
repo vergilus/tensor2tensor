@@ -16,18 +16,24 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
 import collections
+import copy
+import functools
+import multiprocessing
 import os
 import random
 
 import six
-import tensorflow as tf
-
 from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import text_encoder
+# Import modalities: they must be registered before we look them up here.
+from tensor2tensor.layers import modalities  # pylint: disable=unused-import
 from tensor2tensor.utils import data_reader
 from tensor2tensor.utils import metrics
+from tensor2tensor.utils import registry
+import tensorflow as tf
+from tensorflow.contrib.tpu.python.tpu import tpu_config
+
 
 
 class DatasetSplit(object):
@@ -102,6 +108,28 @@ class SpaceID(object):
   PICKLED_PYTHON = 30
 
 
+class TaskID(object):
+  """Problem specific task ids. Add more as needed."""
+  # English characters
+  EN_CHR = 2
+  # English characters sentiment
+  EN_CHR_SENT = 3
+  # English Premise Hypothesis pair
+  EN_PR_HYP = 4
+  # English NLI
+  EN_NLI = 5
+  # COLA
+  COLA = 6
+  # Enligh Question Context pair
+  EN_Q_CONT = 7
+  # English similarity task
+  EN_SIM = 8
+  # English sentence pair
+  EN_SENT_PAIR = 9
+  # 3 class NLI
+  THREE_CL_NLI = 10
+
+
 def default_model_hparams():
   return tf.contrib.training.HParams(
       max_input_seq_length=0,
@@ -115,14 +143,14 @@ def preprocess_example_common(example, hparams, mode):
   """Preprocessing steps common to all models."""
   if hparams.max_input_seq_length > 0:
     example["inputs"] = example["inputs"][:hparams.max_input_seq_length]
-  if hparams.max_target_seq_length > 0:
-    example["targets"] = example["targets"][:hparams.max_target_seq_length]
   if hparams.prepend_mode != "none":
     if mode == tf.estimator.ModeKeys.PREDICT:
       example["partial_targets"] = tf.concat([example["inputs"], [0]], 0)
     else:
       example["targets"] = tf.concat(
           [example["inputs"], [0], example["targets"]], 0)
+  if hparams.max_target_seq_length > 0:
+    example["targets"] = example["targets"][:hparams.max_target_seq_length]
   if hparams.split_to_length:
     example["targets"] = tf.reshape(example["targets"],
                                     [-1, hparams.split_to_length, 1, 1])
@@ -145,6 +173,12 @@ def _file_num_records_cached(filename):
 
 
 _file_num_records_cache = {}
+
+
+def cpu_count():
+  """Return the number of available cores."""
+  num_available_cores = multiprocessing.cpu_count()
+  return num_available_cores
 
 
 class Problem(object):
@@ -255,7 +289,7 @@ class Problem(object):
     Returns:
       an integer
     """
-    if self.batch_size_means_tokens:
+    if self.batch_size_means_tokens and not model_hparams.use_fixed_batch_size:
       return model_hparams.batch_size // self.max_length(model_hparams)
     else:
       return model_hparams.batch_size
@@ -319,11 +353,20 @@ class Problem(object):
         metrics.Metrics.ACC_PER_SEQ, metrics.Metrics.NEG_LOG_PERPLEXITY
     ]
 
+  @property
+  def task_id(self):
+    if self._task_id == -1 and hasattr(self, "global_task_id"):
+      self._task_id = self.global_task_id()
+    return self._task_id
+
+  def set_task_id(self, new_task_id):
+    self._task_id = new_task_id
+
   # ============================================================================
   # END SUBCLASS INTERFACE
   # ============================================================================
 
-  def preprocess(self, dataset, mode, hparams):
+  def preprocess(self, dataset, mode, hparams, interleave=True):
     """Runtime preprocessing on the whole dataset.
 
     Return a tf.data.Datset -- the preprocessed version of the given one.
@@ -333,6 +376,9 @@ class Problem(object):
       dataset: the Dataset of already decoded but not yet preprocessed features.
       mode: tf.estimator.ModeKeys
       hparams: HParams, model hyperparameters
+      interleave: bool, whether to use parallel_interleave, which is faster
+        but will alter the order of samples non-deterministically, or flat_map,
+        which is slower but will preserve the sample order.
 
     Returns:
       a Dataset
@@ -343,10 +389,12 @@ class Problem(object):
         examples = tf.data.Dataset.from_tensors(examples)
       return examples
 
-    is_training = mode == tf.estimator.ModeKeys.TRAIN
-    dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
-            _preprocess, sloppy=is_training, cycle_length=8))
+    if interleave:
+      dataset = dataset.apply(
+          tf.contrib.data.parallel_interleave(
+              _preprocess, sloppy=True, cycle_length=8))
+    else:
+      dataset = dataset.flat_map(_preprocess)
 
     return dataset
 
@@ -414,6 +462,7 @@ class Problem(object):
     self._encoders = None
     self._hparams = None
     self._feature_info = None
+    self._task_id = -1
 
   def get_feature_encoders(self, data_dir=None):
     if self._encoders is None:
@@ -422,6 +471,8 @@ class Problem(object):
 
   def get_hparams(self, model_hparams=None):
     """Returns problem_hparams."""
+    if model_hparams is None:
+      model_hparams = default_model_hparams()
     if self._hparams is not None:
       return self._hparams
 
@@ -445,6 +496,17 @@ class Problem(object):
     if self._was_copy:
       _copy_problem_hparams(hp)
 
+    model_hparams = copy.copy(model_hparams)
+    if (hasattr(model_hparams, "shared_embedding_and_softmax_weights") and
+        model_hparams.shared_embedding_and_softmax_weights):
+      # If vocabularies differ, unset shared_embedding_and_softmax_weights.
+      input_vocab_size = hp.input_modality.get("inputs")[1]
+      target_vocab_size = hp.target_modality[1]
+      if input_vocab_size != target_vocab_size:
+        tf.logging.warn("Unsetting shared_embedding_and_softmax_weights.")
+        model_hparams.shared_embedding_and_softmax_weights = 0
+
+    _create_modalities(hp, model_hparams)
     self._hparams = hp
     return self._hparams
 
@@ -452,18 +514,24 @@ class Problem(object):
     """Reverse features between inputs and targets if the problem is '_rev'."""
     if not self._was_reversed:
       return
-    inputs, targets = feature_map["inputs"], feature_map["targets"]
-    feature_map["inputs"], feature_map["targets"] = targets, inputs
-    if "inputs_segmentation" in feature_map:
-      inputs_seg = feature_map["inputs_segmentation"]
-      targets_seg = feature_map["targets_segmentation"]
-      feature_map["inputs_segmentation"] = targets_seg
+    inputs = feature_map.pop("inputs", None)
+    targets = feature_map.pop("targets", None)
+    inputs_seg = feature_map.pop("inputs_segmentation", None)
+    targets_seg = feature_map.pop("targets_segmentation", None)
+    inputs_pos = feature_map.pop("inputs_position", None)
+    targets_pos = feature_map.pop("targets_position", None)
+    if inputs is not None:
+      feature_map["targets"] = inputs
+    if targets is not None:
+      feature_map["inputs"] = targets
+    if inputs_seg is not None:
       feature_map["targets_segmentation"] = inputs_seg
-    if "inputs_position" in feature_map:
-      inputs_pos = feature_map["inputs_position"]
-      targets_pos = feature_map["targets_position"]
-      feature_map["inputs_position"] = targets_pos
+    if targets_seg is not None:
+      feature_map["inputs_segmentation"] = targets_seg
+    if inputs_pos is not None:
       feature_map["targets_position"] = inputs_pos
+    if targets_pos is not None:
+      feature_map["inputs_position"] = targets_pos
 
   def maybe_copy_features(self, feature_map):
     if not self._was_copy:
@@ -474,8 +542,7 @@ class Problem(object):
       feature_map["targets_segmentation"] = feature_map["inputs_segmentation"]
     if ("inputs_position" in feature_map and
         "targets_position" not in feature_map):
-      self.position_ = feature_map["inputs_position"]
-      feature_map["targets_position"] = self.position_
+      feature_map["targets_position"] = feature_map["inputs_position"]
 
   def maybe_reverse_and_copy(self, example):
     self.maybe_reverse_features(example)
@@ -494,7 +561,8 @@ class Problem(object):
               shard=None,
               partition_id=0,
               num_partitions=1,
-              max_records=-1):
+              max_records=-1,
+              only_last=False):
     """Build a Dataset for this problem.
 
     Args:
@@ -516,6 +584,7 @@ class Problem(object):
       partition_id: integer - which partition of the dataset to read from
       num_partitions: how many partitions in the dataset
       max_records: int, number of records to truncate to.
+      only_last: bool, whether we should include only files from last epoch.
 
     Returns:
       Dataset containing dict<feature name, Tensor>.
@@ -540,20 +609,31 @@ class Problem(object):
     _ = self.get_hparams(hparams)
 
     data_filepattern = self.filepattern(data_dir, dataset_split, shard=shard)
+    if only_last:
+      imprv_data_filepattern = data_filepattern + r"10.[\d+]"
+    else:
+      imprv_data_filepattern = data_filepattern
     tf.logging.info("Reading data files from %s", data_filepattern)
-    data_files = sorted(tf.contrib.slim.parallel_reader.get_data_files(
-        data_filepattern))
+    try:
+      data_files = sorted(tf.contrib.slim.parallel_reader.get_data_files(
+          imprv_data_filepattern))
+    except ValueError:
+      data_files = sorted(tf.contrib.slim.parallel_reader.get_data_files(
+          data_filepattern))
 
-    # Functions used in dataset transforms below
-    def _load_records_and_preprocess(filename):
-      # Load records from file with an 8MiB read buffer.
-      dataset = tf.data.TFRecordDataset(filename, buffer_size=8 * 1024 * 1024)
+    # Functions used in dataset transforms below. `filenames` can be either a
+    # `tf.string` tensor or `tf.data.Dataset` containing one or more filenames.
+    def _load_records_and_preprocess(filenames):
+      """Reads files from a string tensor or a dataset of filenames."""
+      # Load records from file(s) with an 8MiB read buffer.
+      dataset = tf.data.TFRecordDataset(filenames, buffer_size=8 * 1024 * 1024)
       # Decode.
       dataset = dataset.map(self.decode_example, num_parallel_calls=num_threads)
       # Preprocess if requested.
       # Note that preprocessing should happen per-file as order may matter.
       if preprocess:
-        dataset = self.preprocess(dataset, mode, hparams)
+        dataset = self.preprocess(dataset, mode, hparams,
+                                  interleave=shuffle_files)
       return dataset
 
     if len(data_files) < num_partitions:
@@ -567,10 +647,14 @@ class Problem(object):
     if shuffle_files:
       random.shuffle(data_files)
     dataset = tf.data.Dataset.from_tensor_slices(tf.constant(data_files))
+    # Create data-set from files by parsing, pre-processing and interleaving.
+    if shuffle_files:
+      dataset = dataset.apply(
+          tf.contrib.data.parallel_interleave(
+              _load_records_and_preprocess, sloppy=True, cycle_length=8))
+    else:
+      dataset = _load_records_and_preprocess(dataset)
 
-    dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
-            _load_records_and_preprocess, sloppy=is_training, cycle_length=8))
     dataset = dataset.map(
         self.maybe_reverse_and_copy, num_parallel_calls=num_threads)
     dataset = dataset.take(max_records)
@@ -597,6 +681,17 @@ class Problem(object):
     decode_items = list(sorted(data_items_to_decoders))
     decoded = decoder.decode(serialized_example, items=decode_items)
     return dict(zip(decode_items, decoded))
+
+  @property
+  def decode_hooks(self):
+    """List of functions to be run after full decodes have been produced.
+
+    Returns:
+      List of functions. Each function should expect a single argument, an
+      instance of decoding.DecodeHookArgs and optionally return a list of
+      tf.Summary.Value objects.
+    """
+    return []
 
   @property
   def has_inputs(self):
@@ -651,6 +746,8 @@ class Problem(object):
                               mode,
                               hparams,
                               data_dir=None,
+                              force_repeat=False,
+                              prevent_repeat=False,
                               dataset_kwargs=None):
     """Return input_fn wrapped for Estimator."""
 
@@ -661,6 +758,8 @@ class Problem(object):
           data_dir=data_dir,
           params=params,
           config=config,
+          force_repeat=force_repeat,
+          prevent_repeat=prevent_repeat,
           dataset_kwargs=dataset_kwargs)
 
     return estimator_input_fn
@@ -683,7 +782,12 @@ class Problem(object):
       # Reset in the case when using TPU but alternating TRAIN and EVAL.
       self._next_partition_id = 0
       return 0, 1
-    if config.tpu_config.per_host_input_for_training:
+    phift = config.tpu_config.per_host_input_for_training
+    # This is the mesh-tensorflow case.
+    if (hasattr(tpu_config.InputPipelineConfig, "BROADCAST") and
+        phift == tpu_config.InputPipelineConfig.BROADCAST):
+      return 0, 1
+    if phift:
       num_partitions = max(config.tpu_config.num_shards // 8, 1)
     else:
       num_partitions = config.tpu_config.num_shards
@@ -700,6 +804,8 @@ class Problem(object):
                data_dir=None,
                params=None,
                config=None,
+               force_repeat=False,
+               prevent_repeat=False,
                dataset_kwargs=None):
     """Builds input pipeline for problem.
 
@@ -710,6 +816,9 @@ class Problem(object):
       params: dict, may include "batch_size"
       config: RunConfig; should have the data_parallelism attribute if not using
         TPU
+      force_repeat: bool, whether to repeat the data even if not training
+      prevent_repeat: bool, whether to not repeat when in training mode.
+        Overrides force_repeat.
       dataset_kwargs: dict, if passed, will pass as kwargs to self.dataset
         method when called
 
@@ -722,7 +831,7 @@ class Problem(object):
     if config and config.use_tpu:
       num_threads = 64
     else:
-      num_threads = 4 if is_training else 1
+      num_threads = cpu_count() if is_training else 1
 
     max_length = self.max_length(hparams)
 
@@ -752,11 +861,13 @@ class Problem(object):
         "partition_id": partition_id,
         "num_partitions": num_partitions,
     })
-    # print ("data generation params:",data_kwargs)
+
     dataset = self.dataset(**dataset_kwargs)
-    if is_training:
+    if (force_repeat or is_training) and not prevent_repeat:
       # Repeat and skip a random number of records
       dataset = dataset.repeat()
+
+    if is_training:
       data_files = tf.contrib.slim.parallel_reader.get_data_files(
           self.filepattern(data_dir, mode))
       #  In continuous_train_and_eval when switching between train and
@@ -786,8 +897,7 @@ class Problem(object):
         # on TPU, we use params["batch_size"], which specifies the number of
         # examples across all datashards
         batch_size = params["batch_size"]
-        dataset = dataset.apply(
-            tf.contrib.data.batch_and_drop_remainder(batch_size))
+        dataset = dataset.batch(batch_size, drop_remainder=True)
       else:
         num_shards = config.data_parallelism.n if config else 1
         batch_size = hparams.batch_size * num_shards
@@ -806,31 +916,34 @@ class Problem(object):
       else:
         # On GPU, bucket by length
         dataset = dataset.filter(gpu_valid_size)
+        shard_multiplier = config.data_parallelism.n if config else 1
         batching_scheme = data_reader.hparams_to_batching_scheme(
             hparams,
-            shard_multiplier=(config and config.data_parallelism.n) or 1,
+            shard_multiplier=shard_multiplier,
             length_multiplier=self.get_hparams().batch_size_multiplier)
         if hparams.use_fixed_batch_size:
           # Here  batch_size really means examples per datashard.
           batching_scheme["batch_sizes"] = [hparams.batch_size]
           batching_scheme["boundaries"] = []
-        dataset = data_reader.bucket_by_sequence_length(
-            dataset, data_reader.example_length, batching_scheme["boundaries"],
-            batching_scheme["batch_sizes"])
+        dataset = dataset.apply(
+            tf.contrib.data.bucket_by_sequence_length(
+                data_reader.example_length, batching_scheme["boundaries"],
+                batching_scheme["batch_sizes"]))
 
         if not is_training:
-
-          def _pad_batch(features):
-            if not config or config.data_parallelism.n <= 1:
-              return features
+          batch_multiple = shard_multiplier
+          if hparams.use_fixed_batch_size:
+            # Make sure the last batch has the same fixed size as the rest.
+            batch_multiple *= hparams.batch_size
+          if batch_multiple > 1:
             tf.logging.warn(
                 "Padding the batch to ensure that remainder eval batches have "
                 "a batch size divisible by the number of data shards. This may "
                 "lead to incorrect metrics for non-zero-padded features, e.g. "
                 "images. Use a single datashard (i.e. 1 GPU) in that case.")
-            return pad_batch(features, config.data_parallelism.n)
-
-          dataset = dataset.map(_pad_batch, num_parallel_calls=num_threads)
+            dataset = dataset.map(
+                functools.partial(pad_batch, batch_multiple=batch_multiple),
+                num_parallel_calls=num_threads)
 
     dataset = dataset.map(define_shapes, num_parallel_calls=num_threads)
 
@@ -856,6 +969,17 @@ class Problem(object):
 
     return dataset
 
+  @property
+  def export_assets(self):
+    """Assets to export with the model.
+
+    This property contains a dictionary of assets, such as vocabulary files,
+    that should be exported together with the model, or None if no assets
+    are needed.
+    """
+
+    return None
+
   def serving_input_fn(self, hparams):
     """Input fn for serving export, starting from serialized example."""
     mode = tf.estimator.ModeKeys.PREDICT
@@ -866,7 +990,9 @@ class Problem(object):
     dataset = dataset.map(lambda ex: self.preprocess_example(ex, mode, hparams))
     dataset = dataset.map(self.maybe_reverse_and_copy)
     dataset = dataset.map(data_reader.cast_ints_to_int32)
-    dataset = dataset.padded_batch(1000, dataset.output_shapes)
+    dataset = dataset.padded_batch(
+        tf.shape(serialized_example, out_type=tf.int64)[0],
+        dataset.output_shapes)
     dataset = dataset.map(standardize_shapes)
     features = tf.contrib.data.get_single_element(dataset)
 
@@ -936,25 +1062,101 @@ def _reverse_problem_hparams(p_hparams):
   p = p_hparams
 
   # Swap modalities.
-  input_modality = p.input_modality["inputs"]
+  input_modality = p.input_modality.get("inputs")
   target_modality = p.target_modality
-  p.input_modality["inputs"] = target_modality
   p.target_modality = input_modality
+  if target_modality is not None:
+    p.input_modality["inputs"] = target_modality
+  else:
+    p.input_modality = {}
 
   # Swap vocabularies.
-  input_vocabulary = p.vocabulary["inputs"]
-  target_vocabulary = p.vocabulary["targets"]
-  p.vocabulary["inputs"] = target_vocabulary
-  p.vocabulary["targets"] = input_vocabulary
+  input_vocabulary = p.vocabulary.pop("inputs", None)
+  target_vocabulary = p.vocabulary.pop("targets", None)
+  if input_vocabulary is not None:
+    p.vocabulary["targets"] = input_vocabulary
+  if target_vocabulary is not None:
+    p.vocabulary["inputs"] = target_vocabulary
 
   # Swap input/target space ids.
   input_space_id = p.input_space_id
   target_space_id = p.target_space_id
-  p.input_space_id = target_space_id
-  p.target_space_id = input_space_id
+  if input_space_id is not None:
+    p.target_space_id = input_space_id
+  else:
+    p.target_space_id = SpaceID.GENERIC
+  if target_space_id is not None:
+    p.input_space_id = target_space_id
+  else:
+    p.input_space_id = SpaceID.GENERIC
 
   # Mark that p was reversed.
   p.was_reversed = True
+
+
+def _create_modalities(problem_hparams, hparams):
+  """Converts string-type modalities to their modality object.
+
+  Args:
+    problem_hparams: tf.contrib.training.HParams for the Problem. It must have
+      input_modality and target_modality.
+    hparams: tf.contrib.training.HParams for the model. It may have
+      input_modalities and target_modality, which will override
+      problem_hparams's modalities.
+  """
+  input_modality_overrides = {}
+  if hasattr(hparams, "input_modalities"):
+    for override_str in hparams.input_modalities.split(";"):
+      if override_str != "default":
+        parts = override_str.split(":")
+        feature_name = parts[0]
+        modality_name = ":".join(parts[1:])
+        input_modality_overrides[feature_name] = modality_name
+
+  input_modality = {}
+  for f, modality_spec in six.iteritems(problem_hparams.input_modality):
+    if f in input_modality_overrides:
+      _warn_changed_modality_type(input_modality_overrides[f],
+                                  modality_spec[0], f)
+      modality_spec = (input_modality_overrides[f], modality_spec[1])
+    input_modality[f] = registry.create_modality(modality_spec, hparams)
+  problem_hparams.input_modality = input_modality
+
+  target_modality_name = None
+  if (hasattr(hparams, "target_modality") and
+      hparams.target_modality != "default"):
+    target_modality_name = hparams.target_modality
+
+  if problem_hparams.target_modality is None:
+    target_modality = None
+  elif isinstance(problem_hparams.target_modality, dict):
+    target_modality = {}
+    for f, modality_spec in six.iteritems(problem_hparams.target_modality):
+      # TODO(lukaszkaiser): allow overriding other target modalities.
+      if target_modality_name and f == "targets":
+        _warn_changed_modality_type(target_modality_name, modality_spec[0],
+                                    "target_modality/%s" % f)
+        modality_spec = (target_modality_name, modality_spec[1])
+      target_modality[f] = registry.create_modality(modality_spec, hparams)
+  else:
+    target_modality_spec = problem_hparams.target_modality
+    if target_modality_name:
+      _warn_changed_modality_type(target_modality_name,
+                                  target_modality_spec[0], "target")
+      target_modality_spec = (target_modality_name, target_modality_spec[1])
+    target_modality = registry.create_modality(target_modality_spec,
+                                               hparams)
+  problem_hparams.target_modality = target_modality
+
+
+def _warn_changed_modality_type(new_name, old_name, feature_name):
+  new_type, new_name = registry.parse_modality_name(new_name)
+  old_type, old_name = registry.parse_modality_name(old_name)
+  if new_type != old_type:
+    tf.logging.warn(
+        "%s has a designated modality type %s (%s) but has been "
+        "overridden with a modality of type %s (%s).", feature_name, old_type,
+        old_name, new_type, new_name)
 
 
 def _default_hparams():

@@ -19,21 +19,20 @@ from __future__ import division
 from __future__ import print_function
 
 import gzip
-import multiprocessing as mp
 import os
 import random
 import stat
 import tarfile
 import tempfile
-
 import requests
 import six
+from six.moves import range  # pylint: disable=redefined-builtin
 # Imports urllib on Python2, urllib.request on Python3
 import six.moves.urllib_request as urllib
-import tensorflow as tf
-from six.moves import range  # pylint: disable=redefined-builtin
 
 from tensor2tensor.data_generators import text_encoder
+
+import tensorflow as tf
 
 UNSHUFFLED_SUFFIX = "-unshuffled"
 
@@ -145,7 +144,8 @@ def generate_files(generator, output_filenames,
       switching to the next shard; by default set to 1, switch every case.
   """
   if outputs_exist(output_filenames):
-    tf.logging.info("Skipping generator because outputs files exist")
+    tf.logging.info("Skipping generator because outputs files exists at {}"
+                    .format(output_filenames))
     return
   tmp_filenames = [fname + ".incomplete" for fname in output_filenames]
   num_shards = len(output_filenames)
@@ -154,7 +154,7 @@ def generate_files(generator, output_filenames,
   for case in generator:
     if case is None:
       continue
-    if counter > 0 and counter % 100000 == 0:
+    if counter % 100000 == 0:
       tf.logging.info("Generating case %d." % counter)
     counter += 1
     if max_cases and counter > max_cases:
@@ -342,52 +342,54 @@ def get_or_generate_vocab(data_dir, tmp_dir, vocab_filename, vocab_size,
                           sources, file_byte_budget=1e6):
   """Generate a vocabulary from the datasets in sources."""
 
-  def generate():
-    """Generate lines for vocabulary generation."""
-    tf.logging.info("Generating vocab from: %s", str(sources))
-    for source in sources:
-      url = source[0]
-      filename = os.path.basename(url)
-      compressed_file = maybe_download(tmp_dir, filename, url)
-
-      for lang_file in source[1]:
-        tf.logging.info("Reading file: %s" % lang_file)
-        filepath = os.path.join(tmp_dir, lang_file)
-
-        # Extract from tar if needed.
-        if not tf.gfile.Exists(filepath):
-          read_type = "r:gz" if filename.endswith("tgz") else "r"
-          with tarfile.open(compressed_file, read_type) as corpus_tar:
-            corpus_tar.extractall(tmp_dir)
-
-        # For some datasets a second extraction is necessary.
-        if lang_file.endswith(".gz"):
-          new_filepath = os.path.join(tmp_dir, lang_file[:-3])
-          if tf.gfile.Exists(new_filepath):
-            tf.logging.info(
-                "Subdirectory %s already exists, skipping unpacking" % filepath)
-          else:
-            tf.logging.info("Unpacking subdirectory %s" % filepath)
-            gunzip_file(filepath, new_filepath)
-          filepath = new_filepath
-
-        with tf.gfile.GFile(filepath, mode="r") as source_file:
-          file_byte_budget_ = file_byte_budget
-          counter = 0
-          countermax = int(source_file.size() / file_byte_budget_ / 2)
-          for line in source_file:
-            if counter < countermax:
-              counter += 1
-            else:
-              if file_byte_budget_ <= 0:
-                break
-              line = line.strip()
-              file_byte_budget_ -= len(line)
-              counter = 0
-              yield line
-
+  vocab_generator = generate_lines_for_vocab(tmp_dir, sources, file_byte_budget)
   return get_or_generate_vocab_inner(data_dir, vocab_filename, vocab_size,
-                                     generate(), max_subtoken_length=18)
+                                     vocab_generator)
+
+
+def generate_lines_for_vocab(tmp_dir, sources, file_byte_budget=1e6):
+  """Generate lines for vocabulary generation."""
+  tf.logging.info("Generating vocab from: %s", str(sources))
+  for source in sources:
+    url = source[0]
+    filename = os.path.basename(url)
+    compressed_file = maybe_download(tmp_dir, filename, url)
+
+    for lang_file in source[1]:
+      tf.logging.info("Reading file: %s" % lang_file)
+      filepath = os.path.join(tmp_dir, lang_file)
+
+      # Extract from tar if needed.
+      if not tf.gfile.Exists(filepath):
+        read_type = "r:gz" if filename.endswith("tgz") else "r"
+        with tarfile.open(compressed_file, read_type) as corpus_tar:
+          corpus_tar.extractall(tmp_dir)
+
+      # For some datasets a second extraction is necessary.
+      if lang_file.endswith(".gz"):
+        new_filepath = os.path.join(tmp_dir, lang_file[:-3])
+        if tf.gfile.Exists(new_filepath):
+          tf.logging.info(
+              "Subdirectory %s already exists, skipping unpacking" % filepath)
+        else:
+          tf.logging.info("Unpacking subdirectory %s" % filepath)
+          gunzip_file(filepath, new_filepath)
+        filepath = new_filepath
+
+      with tf.gfile.GFile(filepath, mode="r") as source_file:
+        file_byte_budget_ = file_byte_budget
+        counter = 0
+        countermax = int(source_file.size() / file_byte_budget_ / 2)
+        for line in source_file:
+          if counter < countermax:
+            counter += 1
+          else:
+            if file_byte_budget_ <= 0:
+              break
+            line = line.strip()
+            file_byte_budget_ -= len(line)
+            counter = 0
+            yield line
 
 
 def get_or_generate_tabbed_vocab(data_dir, tmp_dir, source_filename,
@@ -481,15 +483,14 @@ def _shuffle_single(fname):
 
 
 def shuffle_dataset(filenames):
+  """Shuffles the dataset."""
   if outputs_exist(filenames):
     tf.logging.info("Skipping shuffle because output files exist")
     return
   tf.logging.info("Shuffling data...")
-  if len(filenames) > 1:
-    pool = mp.Pool(min(len(filenames), 20))
-    pool.map(_shuffle_single, filenames)
-  else:
-    _shuffle_single(filenames[0])
+  for filename in filenames:
+    _shuffle_single(filename)
+  tf.logging.info("Data shuffled.")
 
 
 class SequencePacker(object):

@@ -18,67 +18,46 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
-import shutil
-from tensor2tensor import models  # pylint: disable=unused-import
 from tensor2tensor.data_generators import algorithmic
-from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem as problem_lib
+from tensor2tensor.models import transformer  # pylint: disable=unused-import
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import trainer_lib
-
 import tensorflow as tf
-
-
-@registry.register_problem
-class TinyAlgo(algorithmic.AlgorithmicIdentityBinary40):
-
-  def generate_data(self, data_dir, tmp_dir, task_id=-1):
-    del tmp_dir, task_id
-    identity_problem = algorithmic.AlgorithmicIdentityBinary40()
-    generator_utils.generate_files(
-        identity_problem.generator(self.num_symbols, 40, 100000),
-        self.training_filepaths(data_dir, 1, shuffled=True), 100)
-    generator_utils.generate_files(
-        identity_problem.generator(self.num_symbols, 400, 10000),
-        self.dev_filepaths(data_dir, 1, shuffled=True), 100)
 
 
 class TrainerLibTest(tf.test.TestCase):
 
   @classmethod
   def setUpClass(cls):
-    tmp_dir = tf.test.get_temp_dir()
-    shutil.rmtree(tmp_dir)
-    os.mkdir(tmp_dir)
-    cls.data_dir = tmp_dir
-
-    # Generate a small test dataset
-    registry.problem("tiny_algo").generate_data(cls.data_dir, None)
+    algorithmic.TinyAlgo.setup_for_test()
 
   def testExperiment(self):
     exp_fn = trainer_lib.create_experiment_fn(
         "transformer",
         "tiny_algo",
-        self.data_dir,
+        algorithmic.TinyAlgo.data_dir,
         train_steps=1,
         eval_steps=1,
         min_eval_frequency=1,
         use_tpu=False)
     run_config = trainer_lib.create_run_config(
-        model_dir=self.data_dir, num_gpus=0, use_tpu=False)
-    hparams = registry.hparams("transformer_tiny_tpu")()
+        model_dir=algorithmic.TinyAlgo.data_dir, num_gpus=0,
+        use_tpu=False)
+    hparams = registry.hparams("transformer_tiny_tpu")
     exp = exp_fn(run_config, hparams)
     exp.test()
 
   def testModel(self):
     # HParams
     hparams = trainer_lib.create_hparams(
-        "transformer_tiny", data_dir=self.data_dir, problem_name="tiny_algo")
+        "transformer_tiny", data_dir=algorithmic.TinyAlgo.data_dir,
+        problem_name="tiny_algo")
 
     # Dataset
     problem = hparams.problem
-    dataset = problem.dataset(tf.estimator.ModeKeys.TRAIN, self.data_dir)
+    dataset = problem.dataset(tf.estimator.ModeKeys.TRAIN,
+                              algorithmic.TinyAlgo.data_dir)
     dataset = dataset.repeat(None).padded_batch(10, dataset.output_shapes)
     features = dataset.make_one_shot_iterator().get_next()
     features = problem_lib.standardize_shapes(features)
@@ -99,19 +78,23 @@ class TrainerLibTest(tf.test.TestCase):
       self.assertEqual(loss_val.shape, tuple())
 
   def testMultipleTargetModalities(self):
-    # HParams
+    # Use existing hparams and override target modality.
     hparams = trainer_lib.create_hparams(
-        "transformer_tiny", data_dir=self.data_dir, problem_name="tiny_algo")
-    tm = hparams.problem.get_hparams().target_modality
-    hparams.problem.get_hparams().target_modality = {
-        "targets": tm,
-        "A": tm,
-        "B": tm
+        "transformer_tiny", data_dir=algorithmic.TinyAlgo.data_dir,
+        problem_name="tiny_algo")
+    # Manually turn off sharing. It is not currently supported for multitargets.
+    hparams.shared_embedding_and_softmax_weights = 0  # pylint: disable=line-too-long
+    hparams.problem_hparams.target_modality = {
+        "targets": hparams.problem_hparams.target_modality,
+        "A": hparams.problem_hparams.target_modality,
+        "B": hparams.problem_hparams.target_modality,
     }
+    hparams.problem._hparams = hparams.problem_hparams
 
     # Dataset
     problem = hparams.problem
-    dataset = problem.dataset(tf.estimator.ModeKeys.TRAIN, self.data_dir)
+    dataset = problem.dataset(tf.estimator.ModeKeys.TRAIN,
+                              algorithmic.TinyAlgo.data_dir)
     dataset = dataset.repeat(None).padded_batch(10, dataset.output_shapes)
     features = dataset.make_one_shot_iterator().get_next()
     features = problem_lib.standardize_shapes(features)

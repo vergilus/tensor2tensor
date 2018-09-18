@@ -48,10 +48,6 @@ class SentimentIMDB(text_problems.Text2ClassProblem):
     }]
 
   @property
-  def vocab_filename(self):
-    return "sentiment_imdb.vocab.%d" % self.approx_vocab_size
-
-  @property
   def approx_vocab_size(self):
     return 2**13  # 8k vocab suffices for this small dataset.
 
@@ -95,3 +91,15 @@ class SentimentIMDB(text_problems.Text2ClassProblem):
           "inputs": doc,
           "label": int(label),
       }
+
+
+@registry.register_problem
+class SentimentIMDBCharacters(SentimentIMDB):
+  """IMDB sentiment classification, character level."""
+
+  @property
+  def vocab_type(self):
+    return text_problems.VocabType.CHARACTER
+
+  def global_task_id(self):
+    return problem.TaskID.EN_CHR_SENT

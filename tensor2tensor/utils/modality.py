@@ -52,6 +52,8 @@ class Modality(object):
 
   def __init__(self, model_hparams, vocab_size=None):
     self._model_hparams = model_hparams
+    if vocab_size is not None and hasattr(model_hparams, "vocab_divisor"):
+      vocab_size += (0 - vocab_size) % model_hparams.vocab_divisor
     self._vocab_size = vocab_size
 
   @property
@@ -175,14 +177,16 @@ class Modality(object):
     """
     return data_parallelism(self.top, sharded_body_output, sharded_targets)
 
-  def loss(self, top_out, targets):
+  def loss(self, top_out, targets, weights_fn=None):
     """Compute loss numerator and denominator for one shard of output."""
     logits = top_out
+    if weights_fn is None:
+      weights_fn = self.targets_weights_fn
     return common_layers.padded_cross_entropy(
         logits,
         targets,
         self._model_hparams.label_smoothing,
-        weights_fn=self.targets_weights_fn)
+        weights_fn=weights_fn)
 
   def loss_sharded(self, sharded_top_out, sharded_targets, data_parallelism):
     """Compute loss for all shards."""

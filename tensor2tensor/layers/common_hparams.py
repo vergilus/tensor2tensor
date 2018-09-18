@@ -64,6 +64,8 @@ def basic_params1():
       optimizer_adafactor_memory_exponent=0.8,
       optimizer_adafactor_clipping_threshold=1.0,
       optimizer_adafactor_multiply_by_parameter_scale=True,
+      # Number of accumulating steps for multi step optimizers.
+      optimizer_multistep_accumulate_steps=None,
       weight_decay=1e-6,
       weight_noise=0.0,
       # Defines the learning rate as a product of named functions.
@@ -124,6 +126,8 @@ def basic_params1():
       # epsilon parameter to normalization function
       norm_epsilon=1e-6,
       symbol_modality_num_shards=1,
+      # pad vocabularies so that this value divides the vocabulary size.
+      vocab_divisor=1,
       # During training, we drop sequences whose inputs and targets are shorter
       # than min_length
       min_length=0,
@@ -150,12 +154,15 @@ def basic_params1():
       # during eval
       eval_run_autoregressive=False,
       # TODO(lukaszkaiser): these parameters should probably be set elsewhere.
-      # in SymbolModality, share the output embeddings and the softmax
-      # variables.
-      # You can also share the input embeddings with the output embeddings
+      # (SymbolModality) - If this flag is on, we try to share all of the input
+      # embeddings, the target embeddings and the softmax weights.
+      shared_embedding_and_softmax_weights=False,
+      # (SymbolModality) - If this flag is on, we try to share the input
+      # embeddings and the target embeddings.
+      # You can also share the input embeddings with the target embeddings
       # by using a problem_hparams that uses the same modality object for
       # the input_modality and target_modality.
-      shared_embedding_and_softmax_weights=False,
+      shared_embedding=False,
       # In SymbolModality, skip the top layer, assume we're providing logits.
       symbol_modality_skip_top=False,
       # For each feature for which you want to override the default input
@@ -183,6 +190,9 @@ def basic_params1():
       # examples.  e.g.  The examples may be written with length 65536, but we
       # want to split each example into 64 examples of length 1024.
       split_to_length=0,
+      # Video settings: how many frames to batch on input and targets.
+      video_num_input_frames=1,
+      video_num_target_frames=1,
       # This flag allows us to optionally treat a seq-to-seq problem
       # as a language model.  Legal values are:
       #
@@ -238,6 +248,40 @@ def basic_params1():
       #   roundoff.  Initial experiments show that model quality is similar
       #   to baseline for about 3M training steps, but worse thereafter.
       weight_dtype="float32",
+      # Directory containing a checkpoint for a pretrained model. This will only
+      # be used if a new run is being started. Parameters not found in the
+      # pretrained model will be randomly initialized. Superfluous parameters in
+      # the pretrained model will be ignored.
+      pretrained_model_dir="",
+      # Threshold used for two cases: the primary task probability for the
+      # constant mixing schedule, and the exponential schedule limit for when
+      # mixing should stop (eg: 0.5 means stop at 50-50 mixing, 0.8 means stop
+      # at 20-80 mixing for the primary-others mixing case.)
+      multiproblem_schedule_threshold=0.5,
+      # The number of examples at which the proportion of the mixed in datasets
+      # is multiproblem_schedule_threshold
+      multiproblem_schedule_max_examples=1e7,
+      # When training multiproblems, we can mix the data according to different
+      # schedules. Example: a constant schedule mixing 20-80 between the primary
+      # and other tasks.
+      # A list of supported schedules can be found in
+      # `data_generators.multi_problem.py`.
+      multiproblem_mixing_schedule="constant",
+      # A scalar to upweight the classifier loss in a multiproblem setting.
+      multiproblem_class_loss_multiplier=0.0,
+      # A boolean that decides whether input sequence losses and target label
+      # losses in classification problems should be reweighted.
+      multiproblem_reweight_label_loss=False,
+      # How much weight the targets in classification problems receive. Inputs
+      # receive 1 minus this weight.
+      multiproblem_label_weight=0.5,
+      # Hyperparameters for relative attention.
+      # The maximum relative positional distance to learn an embedding for.
+      max_relative_position=0,
+      # If heads share the same relative embedding.
+      heads_share_relative_embedding=False,
+      # If relative embedding terms are added to values too.
+      add_relative_to_values=False,
   )
 
 

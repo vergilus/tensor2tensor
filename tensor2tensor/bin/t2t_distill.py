@@ -40,7 +40,7 @@ def main(argv):
   tf.logging.set_verbosity(tf.logging.INFO)
   trainer_lib.set_random_seed(FLAGS.random_seed)
   usr_dir.import_usr_dir(FLAGS.t2t_usr_dir)
-  t2t_trainer.log_registry()
+  t2t_trainer.maybe_log_registry_and_exit()
 
   if FLAGS.cloud_mlengine:
     cloud_mlengine.launch()
@@ -55,37 +55,36 @@ def main(argv):
   if argv:
     t2t_trainer.set_hparams_from_args(argv[1:])
 
-  with t2t_trainer.maybe_cloud_tpu():
-    root_output_dir = FLAGS.output_dir
+  root_output_dir = FLAGS.output_dir
 
-    # Train Teacher ============
-    hparams = t2t_trainer.create_hparams()
-    hparams.distill_phase = "train"
-    teacher_dir = os.path.join(root_output_dir, "teacher")
-    FLAGS.output_dir = teacher_dir
+  # Train Teacher ============
+  hparams = t2t_trainer.create_hparams()
+  hparams.distill_phase = "train"
+  teacher_dir = os.path.join(root_output_dir, "teacher")
+  FLAGS.output_dir = teacher_dir
 
-    exp_fn = t2t_trainer.create_experiment_fn()
-    run_config = t2t_trainer.create_run_config(hparams)
-    exp = exp_fn(run_config, hparams)
-    if t2t_trainer.is_chief():
-      t2t_trainer.save_metadata(hparams)
-    t2t_trainer.execute_schedule(exp)
-    # ==========================
-    # Train Student ============
-    hparams = t2t_trainer.create_hparams()
-    hparams.add_hparam("teacher_dir", teacher_dir)
-    hparams.distill_phase = "distill"
-    student_dir = os.path.join(root_output_dir, "student")
-    FLAGS.output_dir = student_dir
+  exp_fn = t2t_trainer.create_experiment_fn()
+  run_config = t2t_trainer.create_run_config(hparams)
+  exp = exp_fn(run_config, hparams)
+  if t2t_trainer.is_chief():
+    t2t_trainer.save_metadata(hparams)
+  t2t_trainer.execute_schedule(exp)
+  # ==========================
+  # Train Student ============
+  hparams = t2t_trainer.create_hparams()
+  hparams.add_hparam("teacher_dir", teacher_dir)
+  hparams.distill_phase = "distill"
+  student_dir = os.path.join(root_output_dir, "student")
+  FLAGS.output_dir = student_dir
 
-    exp_fn = t2t_trainer.create_experiment_fn()
-    run_config = t2t_trainer.create_run_config(hparams)
-    exp = exp_fn(run_config, hparams)
+  exp_fn = t2t_trainer.create_experiment_fn()
+  run_config = t2t_trainer.create_run_config(hparams)
+  exp = exp_fn(run_config, hparams)
 
-    if t2t_trainer.is_chief():
-      t2t_trainer.save_metadata(hparams)
-    t2t_trainer.execute_schedule(exp)
-    # ==========================
+  if t2t_trainer.is_chief():
+    t2t_trainer.save_metadata(hparams)
+  t2t_trainer.execute_schedule(exp)
+  # ==========================
 
 
 def create_teacher_experiment(run_config, hparams, argv):
@@ -94,7 +93,7 @@ def create_teacher_experiment(run_config, hparams, argv):
   tf.logging.set_verbosity(tf.logging.INFO)
   trainer_lib.set_random_seed(FLAGS.random_seed)
   usr_dir.import_usr_dir(FLAGS.t2t_usr_dir)
-  t2t_trainer.log_registry()
+  t2t_trainer.maybe_log_registry_and_exit()
 
   if FLAGS.cloud_mlengine:
     return cloud_mlengine.launch()
@@ -108,11 +107,10 @@ def create_teacher_experiment(run_config, hparams, argv):
   if argv:
     t2t_trainer.set_hparams_from_args(argv[1:])
 
-  with t2t_trainer.maybe_cloud_tpu():
-    hparams.distill_phase = "train"
-    exp_fn = t2t_trainer.create_experiment_fn()
-    exp = exp_fn(run_config, hparams)
-    return exp
+  hparams.distill_phase = "train"
+  exp_fn = t2t_trainer.create_experiment_fn()
+  exp = exp_fn(run_config, hparams)
+  return exp
 
 
 def create_student_experiment(run_config, hparams, argv):
@@ -121,7 +119,7 @@ def create_student_experiment(run_config, hparams, argv):
   tf.logging.set_verbosity(tf.logging.INFO)
   trainer_lib.set_random_seed(FLAGS.random_seed)
   usr_dir.import_usr_dir(FLAGS.t2t_usr_dir)
-  t2t_trainer.log_registry()
+  t2t_trainer.maybe_log_registry_and_exit()
 
   if FLAGS.cloud_mlengine:
     return cloud_mlengine.launch()
@@ -135,12 +133,11 @@ def create_student_experiment(run_config, hparams, argv):
   if argv:
     t2t_trainer.set_hparams_from_args(argv[1:])
 
-  with t2t_trainer.maybe_cloud_tpu():
-    hparams.add_hparam("teacher_dir", FLAGS.teacher_dir)
-    hparams.distill_phase = "distill"
-    exp_fn = t2t_trainer.create_experiment_fn()
-    exp = exp_fn(run_config, hparams)
-    return exp
+  hparams.add_hparam("teacher_dir", FLAGS.teacher_dir)
+  hparams.distill_phase = "distill"
+  exp_fn = t2t_trainer.create_experiment_fn()
+  exp = exp_fn(run_config, hparams)
+  return exp
 
 
 def create_experiment_fn(argv, train_teacher):
@@ -155,4 +152,5 @@ def create_experiment_fn(argv, train_teacher):
 
 
 if __name__ == "__main__":
+  tf.logging.set_verbosity(tf.logging.INFO)
   tf.app.run()

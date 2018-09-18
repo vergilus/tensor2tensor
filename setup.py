@@ -5,7 +5,7 @@ from setuptools import setup
 
 setup(
     name='tensor2tensor',
-    version='1.6.3',
+    version='1.9.0',
     description='Tensor2Tensor',
     author='Google Inc.',
     author_email='no-reply@google.com',
@@ -41,15 +41,31 @@ setup(
         'gym',
         'h5py',
         'numpy',
+        'oauth2client',
         'requests',
         'scipy',
         'sympy',
         'six',
+        'tqdm',
     ],
     extras_require={
-        'tensorflow': ['tensorflow>=1.5.0'],
-        'tensorflow_gpu': ['tensorflow-gpu>=1.5.0'],
-        'tests': ['pytest', 'mock', 'pylint'],
+        'tensorflow': ['tensorflow>=1.9.0'],
+        'tensorflow_gpu': ['tensorflow-gpu>=1.9.0'],
+        'tensorflow-hub': ['tensorflow-hub>=0.1.1'],
+        'tests': [
+            'absl-py',
+            'pytest>=3.8.0',
+            'mock',
+            'pylint',
+            'jupyter',
+            'gsutil',
+            'matplotlib',
+            # Need atari extras for Travis tests, but because gym is already in
+            # install_requires, pip skips the atari extras, so we instead do an
+            # explicit pip install gym[atari] for the tests.
+            # 'gym[atari]',
+        ],
+        'allen': ['Pillow==5.1.0', 'pandas==0.23.0'],
     },
     classifiers=[
         'Development Status :: 4 - Beta',
@@ -57,6 +73,9 @@ setup(
         'Intended Audience :: Science/Research',
         'License :: OSI Approved :: Apache Software License',
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    ],
+    dependency_links=[
+        'git+https://github.com/tensorflow/cleverhans.git#egg=cleverhans'
     ],
     keywords='tensorflow machine learning',
 )

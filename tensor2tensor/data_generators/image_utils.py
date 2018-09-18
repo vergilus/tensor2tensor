@@ -18,14 +18,70 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+
+import io
 import os
+import numpy as np
 from tensor2tensor.data_generators import generator_utils
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
+from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import metrics
 from tensor2tensor.utils import registry
 
 import tensorflow as tf
+
+
+def matplotlib_pyplot():
+  import matplotlib  # pylint: disable=g-import-not-at-top
+  matplotlib.use("agg")
+  import matplotlib.pyplot as plt  # pylint: disable=g-import-not-at-top
+  return plt
+
+
+def image_to_tf_summary_value(image, tag):
+  """Converts a NumPy image to a tf.Summary.Value object.
+
+  Args:
+    image: 3-D NumPy array.
+    tag: name for tf.Summary.Value for display in tensorboard.
+  Returns:
+    image_summary: A tf.Summary.Value object.
+  """
+  curr_image = np.asarray(image, dtype=np.uint8)
+  height, width, n_channels = curr_image.shape
+  s = io.BytesIO()
+  matplotlib_pyplot().imsave(s, curr_image, format="png")
+  img_sum = tf.Summary.Image(encoded_image_string=s.getvalue(),
+                             height=height, width=width,
+                             colorspace=n_channels)
+  return tf.Summary.Value(tag=tag, image=img_sum)
+
+
+def convert_predictions_to_image_summaries(hook_args):
+  """Optionally converts images from hooks_args to image summaries.
+
+  Args:
+    hook_args: DecodeHookArgs namedtuple
+  Returns:
+    summaries: list of tf.Summary values if hook_args.decode_hpara
+  """
+  decode_hparams = hook_args.decode_hparams
+  if not decode_hparams.display_decoded_images:
+    return []
+  predictions = hook_args.predictions[0]
+
+  # Display ten random inputs and outputs so that tensorboard does not hang.
+  all_summaries = []
+  rand_predictions = np.random.choice(predictions, size=10)
+  for ind, prediction in enumerate(rand_predictions):
+    output_summary = image_to_tf_summary_value(
+        prediction["outputs"], tag="%d_output" % ind)
+    input_summary = image_to_tf_summary_value(
+        prediction["inputs"], tag="%d_input" % ind)
+    all_summaries.append(input_summary)
+    all_summaries.append(output_summary)
+  return all_summaries
 
 
 def resize_by_area(img, size):
@@ -37,7 +93,18 @@ def resize_by_area(img, size):
 def make_multiscale(image, resolutions,
                     resize_method=tf.image.ResizeMethod.BICUBIC,
                     num_channels=3):
-  """Returns list of scaled images, one for each resolution."""
+  """Returns list of scaled images, one for each resolution.
+
+  Args:
+    image: Tensor of shape [height, height, num_channels].
+    resolutions: List of heights that image's height is resized to.
+    resize_method: tf.image.ResizeMethod.
+    num_channels: Number of channels in image.
+
+  Returns:
+    List of Tensors, one for each resolution with shape given by
+    [resolutions[i], resolutions[i], num_channels].
+  """
   scaled_images = []
   for height in resolutions:
     scaled_image = tf.image.resize_images(
@@ -51,6 +118,35 @@ def make_multiscale(image, resolutions,
   return scaled_images
 
 
+def make_multiscale_dilated(image, resolutions, num_channels=3):
+  """Returns list of scaled images, one for each resolution.
+
+  Resizes by skipping every nth pixel.
+
+  Args:
+    image: Tensor of shape [height, height, num_channels].
+    resolutions: List of heights that image's height is resized to. The function
+      assumes VALID padding, so the original image's height must be divisible
+      by each resolution's height to return the exact resolution size.
+    num_channels: Number of channels in image.
+
+  Returns:
+    List of Tensors, one for each resolution with shape given by
+    [resolutions[i], resolutions[i], num_channels] if resolutions properly
+    divide the original image's height; otherwise shape height and width is up
+    to valid skips.
+  """
+  image_height = common_layers.shape_list(image)[0]
+  scaled_images = []
+  for height in resolutions:
+    dilation_rate = image_height // height  # assuming height = width
+    scaled_image = image[::dilation_rate, ::dilation_rate]
+    scaled_image = tf.to_int64(scaled_image)
+    scaled_image.set_shape([None, None, num_channels])
+    scaled_images.append(scaled_image)
+  return scaled_images
+
+
 class ImageProblem(problem.Problem):
   """Base class for problems with images."""
 
@@ -58,6 +154,11 @@ class ImageProblem(problem.Problem):
   def num_channels(self):
     """Number of color channels."""
     return 3
+
+  @property
+  def vocab_size(self):
+    """Number of pixel values."""
+    return 256
 
   def example_reading_spec(self):
     data_fields = {
@@ -88,6 +189,10 @@ class ImageProblem(problem.Problem):
     if self._was_reversed:
       eval_metrics += [metrics.Metrics.IMAGE_SUMMARY]
     return eval_metrics
+
+  @property
+  def decode_hooks(self):
+    return [convert_predictions_to_image_summaries]
 
 
 class Image2ClassProblem(ImageProblem):
@@ -158,9 +263,9 @@ def encode_images_as_png(images):
     for image in images:
       yield tf.image.encode_png(image).numpy()
   else:
-    (width, height, channels) = images[0].shape
+    (height, width, channels) = images[0].shape
     with tf.Graph().as_default():
-      image_t = tf.placeholder(dtype=tf.uint8, shape=(width, height, channels))
+      image_t = tf.placeholder(dtype=tf.uint8, shape=(height, width, channels))
       encoded_image_t = tf.image.encode_png(image_t)
       with tf.Session() as sess:
         for image in images:
@@ -208,7 +313,7 @@ class Image2TextProblem(ImageProblem):
     raise NotImplementedError()
 
   @property
-  def targeted_vocab_size(self):
+  def vocab_problem(self):
     raise NotImplementedError()  # Not needed if self.is_character_level.
 
   @property
@@ -240,7 +345,7 @@ class Image2TextProblem(ImageProblem):
       encoder = text_encoder.ByteTextEncoder()
     else:
       vocab_filename = os.path.join(
-          data_dir, "vocab.ende.%d" % self.targeted_vocab_size)
+          data_dir, self.vocab_problem.vocab_filename)
       encoder = text_encoder.SubwordTextEncoder(vocab_filename)
     input_encoder = text_encoder.ImageEncoder(channels=self.num_channels)
     return {"inputs": input_encoder, "targets": encoder}
@@ -291,3 +396,23 @@ def cifar_image_augmentation(images):
   images = tf.random_crop(images, [32, 32, 3])
   images = tf.image.random_flip_left_right(images)
   return images
+
+
+def random_shift(image, wsr=0.1, hsr=0.1):
+  """Apply random horizontal and vertical shift to images.
+
+  This is the default data-augmentation strategy used on CIFAR in Glow.
+
+  Args:
+    image: a 3-D Tensor
+    wsr: Width shift range, as a float fraction of the width.
+    hsr: Height shift range, as a float fraction of the width.
+  Returns:
+    images: images translated by the provided wsr and hsr.
+  """
+  height, width, _ = common_layers.shape_list(image)
+  width_range, height_range = wsr*width, hsr*height
+  height_translations = tf.random_uniform((1,), -height_range, height_range)
+  width_translations = tf.random_uniform((1,), -width_range, width_range)
+  translations = tf.concat((height_translations, width_translations), axis=0)
+  return tf.contrib.image.translate(image, translations=translations)

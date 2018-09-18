@@ -20,10 +20,8 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-import gym
 
 from tensor2tensor.rl.envs.in_graph_batch_env import InGraphBatchEnv
-
 import tensorflow as tf
 
 
@@ -41,14 +39,13 @@ class PyFuncBatchEnv(InGraphBatchEnv):
     Args:
       batch_env: Batch environment.
     """
+    super(PyFuncBatchEnv, self).__init__(batch_env.observation_space,
+                                         batch_env.action_space)
     self._batch_env = batch_env
-    observ_shape = self._parse_shape(self._batch_env.observation_space)
-    observ_dtype = self._parse_dtype(self._batch_env.observation_space)
-    self.action_shape = list(self._parse_shape(self._batch_env.action_space))
-    self.action_dtype = self._parse_dtype(self._batch_env.action_space)
     with tf.variable_scope('env_temporary'):
       self._observ = tf.Variable(
-          tf.zeros((len(self._batch_env),) + observ_shape, observ_dtype),
+          tf.zeros((len(self._batch_env),) + self.observ_shape,
+                   self.observ_dtype),
           name='observ', trainable=False)
 
   def __getattr__(self, name):
@@ -61,6 +58,9 @@ class PyFuncBatchEnv(InGraphBatchEnv):
       Value behind the attribute name in one of the original environments.
     """
     return getattr(self._batch_env, name)
+
+  def initialize(self, sess):
+    pass
 
   def __len__(self):
     """Number of combined environments."""
@@ -84,29 +84,14 @@ class PyFuncBatchEnv(InGraphBatchEnv):
     with tf.name_scope('environment/simulate'):
       if action.dtype in (tf.float16, tf.float32, tf.float64):
         action = tf.check_numerics(action, 'action')
-      observ_dtype = self._parse_dtype(self._batch_env.observation_space)
       observ, reward, done = tf.py_func(
           lambda a: self._batch_env.step(a)[:3], [action],
-          [observ_dtype, tf.float32, tf.bool], name='step')
-      observ = tf.check_numerics(observ, 'observ')
+          [self.observ_dtype, tf.float32, tf.bool], name='step')
       reward = tf.check_numerics(reward, 'reward')
       reward.set_shape((len(self),))
       done.set_shape((len(self),))
       with tf.control_dependencies([self._observ.assign(observ)]):
         return tf.identity(reward), tf.identity(done)
-
-  def reset(self, indices=None):
-    """Reset the batch of environments.
-
-    Args:
-      indices: The batch indices of the environments to reset.
-
-    Returns:
-      Batch tensor of the new observations.
-    """
-    return tf.cond(
-        tf.cast(tf.shape(indices)[0], tf.bool),
-        lambda: self._reset_non_empty(indices), lambda: 0.0)
 
   def _reset_non_empty(self, indices):
     """Reset the batch of environments.
@@ -117,10 +102,9 @@ class PyFuncBatchEnv(InGraphBatchEnv):
     Returns:
       Batch tensor of the new observations.
     """
-    observ_dtype = self._parse_dtype(self._batch_env.observation_space)
     observ = tf.py_func(
-        self._batch_env.reset, [indices], observ_dtype, name='reset')
-    observ = tf.check_numerics(observ, 'observ')
+        self._batch_env.reset, [indices], self.observ_dtype, name='reset')
+    observ.set_shape(indices.get_shape().concatenate(self.observ_shape))
     with tf.control_dependencies([
         tf.scatter_update(self._observ, indices, observ)]):
       return tf.identity(observ)
@@ -128,38 +112,8 @@ class PyFuncBatchEnv(InGraphBatchEnv):
   @property
   def observ(self):
     """Access the variable holding the current observation."""
-    return self._observ
+    return self._observ.read_value()
 
   def close(self):
     """Send close messages to the external process and join them."""
     self._batch_env.close()
-
-  def _parse_shape(self, space):
-    """Get a tensor shape from a OpenAI Gym space.
-
-    Args:
-      space: Gym space.
-
-    Returns:
-      Shape tuple.
-    """
-    if isinstance(space, gym.spaces.Discrete):
-      return ()
-    if isinstance(space, gym.spaces.Box):
-      return space.shape
-    raise NotImplementedError()
-
-  def _parse_dtype(self, space):
-    """Get a tensor dtype from a OpenAI Gym space.
-
-    Args:
-      space: Gym space.
-
-    Returns:
-      TensorFlow data type.
-    """
-    if isinstance(space, gym.spaces.Discrete):
-      return tf.int32
-    if isinstance(space, gym.spaces.Box):
-      return tf.float32
-    raise NotImplementedError()

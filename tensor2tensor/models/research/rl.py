@@ -50,23 +50,38 @@ def ppo_base_v1():
   hparams.add_hparam("save_models_every_epochs", 30)
   hparams.add_hparam("optimization_batch_size", 50)
   hparams.add_hparam("max_gradients_norm", 0.5)
-  hparams.add_hparam("simulated_environment", False)
   hparams.add_hparam("simulation_random_starts", False)
+  hparams.add_hparam("simulation_flip_first_random_for_beginning", False)
   hparams.add_hparam("intrinsic_reward_scale", 0.)
+  hparams.add_hparam("logits_clip", 3.0)
   return hparams
 
 
 @registry.register_hparams
 def ppo_continuous_action_base():
   hparams = ppo_base_v1()
-  hparams.add_hparam("network", feed_forward_gaussian_fun)
+  hparams.add_hparam("policy_network", feed_forward_gaussian_fun)
+  hparams.add_hparam("policy_network_params", "basic_policy_parameters")
   return hparams
+
+
+@registry.register_hparams
+def basic_policy_parameters():
+  wrappers = None
+  return tf.contrib.training.HParams(wrappers=wrappers)
 
 
 @registry.register_hparams
 def ppo_discrete_action_base():
   hparams = ppo_base_v1()
-  hparams.add_hparam("network", feed_forward_categorical_fun)
+  hparams.add_hparam("policy_network", feed_forward_categorical_fun)
+  return hparams
+
+
+@registry.register_hparams
+def discrete_random_action_base():
+  hparams = common_hparams.basic_params1()
+  hparams.add_hparam("policy_network", random_policy_fun)
   return hparams
 
 
@@ -74,7 +89,7 @@ def ppo_discrete_action_base():
 def ppo_atari_base():
   """Atari base parameters."""
   hparams = ppo_discrete_action_base()
-  hparams.learning_rate = 16e-5
+  hparams.learning_rate = 4e-4
   hparams.num_agents = 5
   hparams.epoch_length = 200
   hparams.gae_gamma = 0.985
@@ -92,28 +107,43 @@ def ppo_atari_base():
 def ppo_pong_base():
   """Pong base parameters."""
   hparams = ppo_discrete_action_base()
-  hparams.learning_rate = 8e-5
+  hparams.learning_rate = 2e-4
   hparams.num_agents = 8
   hparams.epoch_length = 200
   hparams.gae_gamma = 0.985
   hparams.gae_lambda = 0.985
   hparams.entropy_loss_coef = 0.003
   hparams.value_loss_coef = 1
-  hparams.optimization_epochs = 2
+  hparams.optimization_epochs = 3
   hparams.epochs_num = 1000
   hparams.num_eval_agents = 1
-  hparams.network = feed_forward_cnn_small_categorical_fun
+  hparams.policy_network = feed_forward_cnn_small_categorical_fun
   hparams.clipping_coef = 0.2
-  hparams.optimization_batch_size = 4
+  hparams.optimization_batch_size = 20
   hparams.max_gradients_norm = 0.5
   return hparams
+
+
+def simple_gym_spec(env):
+  """Parameters of environment specification."""
+  standard_wrappers = None
+  env_lambda = None
+  if isinstance(env, str):
+    env_lambda = lambda: gym.make(env)
+  if callable(env):
+    env_lambda = env
+  assert env_lambda is not None, "Unknown specification of environment"
+
+  return tf.contrib.training.HParams(env_lambda=env_lambda,
+                                     wrappers=standard_wrappers,
+                                     simulated_env=False)
 
 
 @registry.register_hparams
 def ppo_pong_ae_base():
   """Pong autoencoder base parameters."""
   hparams = ppo_pong_base()
-  hparams.learning_rate = 4e-5
+  hparams.learning_rate = 2e-4
   hparams.network = dense_bitwise_categorical_fun
   return hparams
 
@@ -163,6 +193,15 @@ def feed_forward_gaussian_fun(action_space, config, observations):
   return NetworkOutput(policy, value, lambda a: tf.clip_by_value(a, -2., 2))
 
 
+def clip_logits(logits, config):
+  logits_clip = getattr(config, "logits_clip", 0.)
+  if logits_clip > 0:
+    min_logit = tf.reduce_min(logits)
+    return tf.minimum(logits - min_logit, logits_clip)
+  else:
+    return logits
+
+
 def feed_forward_categorical_fun(action_space, config, observations):
   """Feed-forward categorical."""
   if not isinstance(action_space, gym.spaces.Discrete):
@@ -182,13 +221,13 @@ def feed_forward_categorical_fun(action_space, config, observations):
       for size in config.value_layers:
         x = tf.contrib.layers.fully_connected(x, size, tf.nn.relu)
       value = tf.contrib.layers.fully_connected(x, 1, None)[..., 0]
+  logits = clip_logits(logits, config)
   policy = tf.contrib.distributions.Categorical(logits=logits)
   return NetworkOutput(policy, value, lambda a: a)
 
 
 def feed_forward_cnn_small_categorical_fun(action_space, config, observations):
   """Small cnn network with categorical output."""
-  del config
   obs_shape = common_layers.shape_list(observations)
   x = tf.reshape(observations, [-1] + obs_shape[2:])
 
@@ -208,6 +247,7 @@ def feed_forward_cnn_small_categorical_fun(action_space, config, observations):
 
       logits = tf.contrib.layers.fully_connected(x, action_space.n,
                                                  activation_fn=None)
+      logits = clip_logits(logits, config)
 
       value = tf.contrib.layers.fully_connected(
           x, 1, activation_fn=None)[..., 0]
